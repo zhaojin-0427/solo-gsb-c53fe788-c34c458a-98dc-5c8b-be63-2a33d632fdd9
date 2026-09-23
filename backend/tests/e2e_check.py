@@ -39,8 +39,18 @@ from starlette.testclient import TestClient  # noqa: E402
 from app.db import Database  # noqa: E402
 from app.definitions import DrillError, load_file, parse_definition  # noqa: E402
 from app.engine import Engine, EngineError, now_ts, reduce_events  # noqa: E402
+from app.joints import (  # noqa: E402
+    MISSED,
+    RELEASED,
+    WAITING,
+    JointError,
+    JointOrchestrator,
+    assert_acyclic,
+    branch_satisfied,
+)
 from app.main import app  # noqa: E402
 from app.records import build_replay, load_events  # noqa: E402
+from app.snapshots import build_snapshot  # noqa: E402
 from app.versions import content_digest  # noqa: E402
 
 HOST = {"X-Host-Key": "test-key"}
@@ -149,6 +159,64 @@ WS_DRILL = {
             "default_next": None,
             "views": {"b": "乙私有二"},
             "options": {"b": [{"id": "k", "text": "K"}]},
+        },
+    ],
+}
+
+
+# Two independent drills used by the joint-orchestration tests. They pin to
+# different script identities on purpose: a joint must validate against each
+# session's own pinned version and keep their event logs independent.
+JUP = {
+    "id": "jup",
+    "name": "联演上游",
+    "roles": [{"id": "a", "name": "甲", "invite": "AAA"}],
+    "stages": [
+        {
+            "id": "s1", "title": "上游阶段", "public": "上游公开", "duration": None,
+            "default_next": "s2",
+            "options": {"a": [{"id": "go", "text": "推进"}, {"id": "stop", "text": "中止"}]},
+            "transitions": [{"when": {"a": "stop"}, "next": None}],
+        },
+        {
+            "id": "s2", "title": "上游后续", "public": "p2", "duration": None,
+            "default_next": None,
+            "options": {"a": [{"id": "k", "text": "K"}]},
+        },
+    ],
+}
+
+JDOWN = {
+    "id": "jdown",
+    "name": "联演下游",
+    "roles": [
+        {"id": "b", "name": "乙", "invite": "BBB"},
+        {"id": "x", "name": "旁观者", "invite": "XXX"},
+    ],
+    "stages": [
+        {
+            "id": "t1", "title": "下游阶段", "public": "下游公开", "duration": None,
+            "default_next": "t2",
+            "views": {"b": "乙的台面信息"},
+            "options": {"b": [{"id": "k", "text": "乙决定"}]},
+        },
+        {
+            "id": "t2", "title": "下游后续", "public": "t2", "duration": None,
+            "default_next": None,
+            "options": {"b": [{"id": "z", "text": "Z"}]},
+        },
+    ],
+}
+
+JUP2 = {
+    "id": "jup2",
+    "name": "联演上游二",
+    "roles": [{"id": "c", "name": "丙", "invite": "CCC"}],
+    "stages": [
+        {
+            "id": "s1", "title": "第二上游阶段", "public": "上游二公开", "duration": None,
+            "default_next": None,
+            "options": {"c": [{"id": "go", "text": "推进"}]},
         },
     ],
 }
@@ -823,6 +891,168 @@ def test_http_ws_e2e():
         check("无令牌导出被拒", client.get(f"/api/sessions/{sid}/record").status_code == 401)
 
 
+# --------------------------------------------------------------------------- #
+# [14] joint orchestration over HTTP + WebSocket through the real app
+# --------------------------------------------------------------------------- #
+def test_joint_http_ws():
+    print("[14] 联合演练 HTTP + WebSocket 端到端")
+    with TestClient(app) as client:
+        # release both joint drills
+        for dct in (JUP, JDOWN, JUP2):
+            r = client.post("/api/drills", headers=HOST,
+                            json={"yaml": _dump(dct), "base_version": None})
+            assert r.status_code == 200, r.text
+            client.post(f"/api/drills/{dct['id']}/versions/1/publish",
+                        headers=HOST, json={"base_version": None})
+        su = client.post("/api/sessions", params={"drill_id": "jup"}, headers=HOST).json()["session_id"]
+        su2 = client.post("/api/sessions", params={"drill_id": "jup2"}, headers=HOST).json()["session_id"]
+        sd = client.post("/api/sessions", params={"drill_id": "jdown"}, headers=HOST).json()["session_id"]
+
+        # pinned script reference for the editor
+        scr = client.get(f"/api/sessions/{sd}/script", headers=HOST).json()
+        check("剧本引用按会话绑定版本返回",
+              scr["drill_id"] == "jdown" and {r["id"] for r in scr["roles"]} == {"b", "x"}
+              and any(s["id"] == "t1" for s in scr["stages"]))
+        check("联演接口需主持人密钥",
+              client.get("/api/joints").status_code == 401
+              and client.get(f"/api/sessions/{sd}/joints").status_code == 401)
+
+        spec = {
+            "name": "HTTP 联演", "description": "端到端",
+            "members": [su, su2, sd],
+            "gates": [{
+                "id": "g1", "target_session": sd, "target_stage": "t1",
+                "title": "联动关阀", "public": "友邻单位请求联动",
+                "views": {"b": "乙才知道的联动细节"},
+                "prerequisites": [
+                    {"session_id": su, "stage_id": "s1", "kind": "choice",
+                     "role_id": "a", "value": "go"},
+                    {"session_id": su2, "stage_id": "s1", "kind": "choice",
+                     "role_id": "c", "value": "go"},
+                ],
+            }],
+        }
+        r = client.post("/api/joints", headers=HOST, json=spec)
+        check("创建联演 201", r.status_code == 201 and r.json()["gates"][0]["status"] == "waiting")
+        jid = r.json()["id"]
+        check("联演列表含计数", any(j["id"] == jid for j in client.get("/api/joints", headers=HOST).json()))
+        check("会话维度可查联演", len(client.get(f"/api/sessions/{sd}/joints", headers=HOST).json()) == 1)
+
+        # invalid spec -> 400, nothing stored
+        bad = dict(spec, name="坏联演", gates=[dict(spec["gates"][0], target_stage="zzz")])
+        r = client.post("/api/joints", headers=HOST, json=bad)
+        check("保存前校验（无效阶段）400", r.status_code == 400 and "不存在阶段" in r.json()["detail"])
+        cyc = {
+            "name": "环", "members": [su, sd],
+            "gates": [
+                {"id": "a", "target_session": sd, "target_stage": "t1",
+                 "prerequisites": [{"session_id": su, "stage_id": "s1",
+                                    "kind": "next_stage", "value": "s2"}]},
+                {"id": "b", "target_session": su, "target_stage": "s1",
+                 "prerequisites": [{"session_id": sd, "stage_id": "t1",
+                                    "kind": "next_stage", "value": "t2"}]},
+            ],
+        }
+        check("保存前校验（有环）400",
+              client.post("/api/joints", headers=HOST, json=cyc).status_code == 400)
+
+        # join + start all sessions
+        ta = client.post(f"/api/sessions/{su}/join", json={"invite": "AAA", "name": "甲"}).json()["token"]
+        tc = client.post(f"/api/sessions/{su2}/join", json={"invite": "CCC", "name": "丙"}).json()["token"]
+        tb = client.post(f"/api/sessions/{sd}/join", json={"invite": "BBB", "name": "乙"}).json()["token"]
+        tx = client.post(f"/api/sessions/{sd}/join", json={"invite": "XXX", "name": "旁观"}).json()["token"]
+
+        with ExitStack() as stack:
+            # Prime the TestClient websocket portal with a short-lived failed
+            # handshake first (same harness quirk the [10] test relies on).
+            prime = stack.enter_context(client.websocket_connect(f"/ws/{sd}?token=nope"))
+            recv_until(prime, lambda m: m.get("type") == "error", "prime error")
+            wa = stack.enter_context(client.websocket_connect(f"/ws/{su}?token={ta}"))
+            wc = stack.enter_context(client.websocket_connect(f"/ws/{su2}?token={tc}"))
+            wb = stack.enter_context(client.websocket_connect(f"/ws/{sd}?token={tb}"))
+            wx = stack.enter_context(client.websocket_connect(f"/ws/{sd}?token={tx}"))
+            host_up = stack.enter_context(client.websocket_connect(f"/ws/{su}?host=test-key"))
+            host_dn = stack.enter_context(client.websocket_connect(f"/ws/{sd}?host=test-key"))
+            for ws in (wa, wc, wb, wx, host_up, host_dn):
+                recv_until(ws, lambda m: m.get("type") == "snapshot", "snap")
+            host_up.send_json({"type": "start"})
+            host_dn.send_json({"type": "start"})
+            recv_until(wa, lambda m: is_snapshot(m, status="running"), "up running")
+            recv_until(wb, lambda m: is_snapshot(m, status="running"), "down running")
+
+            # first branch only -> still blocked
+            wa.send_json({"type": "submit", "choice_id": "go", "client_stage": "s1"})
+            recv_until(wa, lambda m: m.get("type") == "submit_result", "a result")
+            g = client.get(f"/api/joints/{jid}", headers=HOST).json()["gates"][0]
+            check("HTTP 监控显示单分支已满足、整体等待",
+                  [p["satisfied"] for p in g["prerequisites"]] == [True, False]
+                  and g["status"] == "waiting" and "等待 1 个分支" in g["block_reason"])
+
+            # start second upstream + satisfy the second branch
+            host2 = stack.enter_context(client.websocket_connect(f"/ws/{su2}?host=test-key"))
+            recv_until(host2, lambda m: m.get("type") == "snapshot", "snap")
+            host2.send_json({"type": "start"})
+            recv_until(wc, lambda m: is_snapshot(m, status="running"), "up2 running")
+            wc.send_json({"type": "submit", "choice_id": "go", "client_stage": "s1"})
+            recv_until(wc, lambda m: m.get("type") == "submit_result", "c result")
+
+            # the downstream participants must receive the injection via push
+            def has_injection(msg):
+                if msg.get("type") != "snapshot":
+                    return False
+                hist = msg["snapshot"].get("history") or []
+                return any(h.get("injections") for h in hist)
+
+            snap_b = recv_until(wb, has_injection, "b injection push")
+            snap_x = recv_until(wx, has_injection, "x injection push")
+            inj_b = snap_b["snapshot"]["history"][0]["injections"][0]
+            inj_x = snap_x["snapshot"]["history"][0]["injections"][0]
+            check("WS 推送注入到目标角色（公开+私有）",
+                  inj_b["public"] == "友邻单位请求联动" and inj_b["private"] == "乙才知道的联动细节")
+            check("WS 推送给无关角色仅公开、无私有",
+                  inj_x["public"] == "友邻单位请求联动" and inj_x["private"] == "")
+            check("无关角色推送不含他人私有文本",
+                  "乙才知道的联动细节" not in json.dumps(snap_x, ensure_ascii=False))
+
+            # host console of the target session shows the joint panel data
+            g = client.get(f"/api/sessions/{sd}/joints", headers=HOST).json()[0]["gates"][0]
+            check("主持台联演状态为已投递", g["status"] == "released" and g["event_version"])
+
+        # target session records carry the injection with permission trimming
+        rec_b = client.get(f"/api/sessions/{sd}/record", params={"fmt": "json", "token": tb}).json()
+        rec_x = client.get(f"/api/sessions/{sd}/record", params={"fmt": "json", "token": tx}).json()
+        check("个人记录含公开注入", any(
+            s["joint_injections"] and s["joint_injections"][0]["public"] == "友邻单位请求联动"
+            for s in rec_b["stages"]))
+        check("目标角色个人记录含私有注入", any(
+            inj.get("my_view") == "乙才知道的联动细节"
+            for s in rec_b["stages"] for inj in s.get("joint_injections", [])))
+        check("无关角色个人记录无私有注入",
+              all(not inj.get("my_view")
+                  for s in rec_x["stages"] for inj in s.get("joint_injections", [])))
+        md = client.get(f"/api/sessions/{sd}/record", params={"fmt": "md", "token": tb}).text
+        check("个人 Markdown 含联演注入段", "联演注入" in md)
+        host_md = client.get(f"/api/sessions/{sd}/record", params={"fmt": "md"}, headers=HOST).text
+        check("主持人 Markdown 含注入与角色视图",
+              "联演注入" in host_md and "乙才知道的联动细节" in host_md)
+
+        # upstream sessions' own records contain no injections
+        for sid in (su, su2):
+            rec = client.get(f"/api/sessions/{sid}/record", params={"fmt": "json"}, headers=HOST).json()
+            check(f"上游 {sid} 记录保持独立、无注入",
+                  all(not s.get("joint_injections") for s in rec["stages"]))
+
+        # replace rejects changes to the now-released gate (409), list shows counts
+        r = client.put(f"/api/joints/{jid}", headers=HOST, json=spec)
+        check("原样 PUT 已投递门禁成功（幂等定义）", r.status_code == 200)
+        changed = dict(spec)
+        changed["gates"] = [dict(spec["gates"][0], title="改过标题")]
+        r = client.put(f"/api/joints/{jid}", headers=HOST, json=changed)
+        check("PUT 修改已投递门禁 409", r.status_code == 409)
+        r = client.delete(f"/api/joints/{jid}", headers=HOST)
+        check("删除含已投递门禁联演 409", r.status_code == 409)
+
+
 def test_http_version_api():
     print("[11b] HTTP 版本管理 API")
     http_drill = yaml.safe_load(yaml.safe_dump(WS_DRILL))
@@ -1226,11 +1456,287 @@ async def test_legacy_migration():
 
 
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# [13] joint exercise orchestration
+# --------------------------------------------------------------------------- #
+async def test_joint_orchestration(eng):
+    print("[13] 联合演练编排（依赖/AND/一次性/乱序/权限/独立版本）")
+    jo = JointOrchestrator(eng.db, eng)
+
+    # ------------------------------------------------------------------ #
+    # validation: acyclic, valid sessions/stages/outcomes/roles
+    # ------------------------------------------------------------------ #
+    try:
+        assert_acyclic([
+            {"target_session": "sA", "target_stage": "1",
+             "prerequisites": [{"session_id": "sB", "stage_id": "1", "kind": "next_stage", "value": ""}]},
+            {"target_session": "sB", "target_stage": "1",
+             "prerequisites": [{"session_id": "sA", "stage_id": "1", "kind": "next_stage", "value": ""}]},
+        ])
+        check("跨会话循环依赖被拒", False)
+    except JointError:
+        check("跨会话循环依赖被拒", True)
+    try:
+        assert_acyclic([
+            {"target_session": "sA", "target_stage": "1",
+             "prerequisites": [{"session_id": "sA", "stage_id": "1", "kind": "next_stage", "value": ""}]},
+        ])
+        check("自环依赖被拒", False)
+    except JointError:
+        check("自环依赖被拒", True)
+    # a DAG passes
+    assert_acyclic([
+        {"target_session": "sA", "target_stage": "2",
+         "prerequisites": [{"session_id": "sA", "stage_id": "1", "kind": "next_stage", "value": "2"}]},
+    ])
+    check("无环 DAG 通过校验", True)
+
+    su = await eng.create_session("jup")
+    sd = await eng.create_session("jdown")
+    su2 = await eng.create_session("jup2")
+
+    base_spec = {
+        "name": "厂际联演", "members": [su, sd, su2],
+        "gates": [{
+            "id": "g1", "target_session": sd, "target_stage": "t1",
+            "title": "联动请求", "public": "请配合关阀", "views": {"b": "乙的专属联演情报"},
+            "prerequisites": [
+                {"session_id": su, "stage_id": "s1", "kind": "choice",
+                 "role_id": "a", "value": "go"},
+                {"session_id": su2, "stage_id": "s1", "kind": "choice",
+                 "role_id": "c", "value": "go"},
+            ],
+        }],
+    }
+    bad_cases = [
+        ({"name": "x", "members": ["deadbeef"], "gates": []}, "成员会话不存在"),
+        ({"name": "x", "members": [sd], "gates": [{
+            "id": "g", "target_session": sd, "target_stage": "nope",
+            "prerequisites": [{"session_id": sd, "stage_id": "t1",
+                               "kind": "next_stage", "value": ""}]}]}, "目标阶段不存在"),
+        ({"name": "x", "members": [sd], "gates": [{
+            "id": "g", "target_session": sd, "target_stage": "t1",
+            "prerequisites": [{"session_id": sd, "stage_id": "t1",
+                               "kind": "choice", "role_id": "b", "value": "nope"}]}]},
+         "结局选项不存在"),
+        ({"name": "x", "members": [sd], "gates": [{
+            "id": "g", "target_session": sd, "target_stage": "t1",
+            "prerequisites": [{"session_id": sd, "stage_id": "t1",
+                               "kind": "choice", "role_id": "ghost", "value": "k"}]}]},
+         "角色不存在"),
+        ({"name": "x", "members": [sd], "gates": [{
+            "id": "g", "target_session": sd, "target_stage": "t1",
+            "views": {"ghost": "x"},
+            "prerequisites": [{"session_id": sd, "stage_id": "t1",
+                               "kind": "next_stage", "value": ""}]}]}, "推送角色不存在"),
+        ({"name": "x", "members": [sd], "gates": [{
+            "id": "g", "target_session": sd, "target_stage": "t1",
+            "prerequisites": [
+                {"session_id": sd, "stage_id": "t1", "kind": "next_stage", "value": ""},
+                {"session_id": sd, "stage_id": "t1", "kind": "next_stage", "value": ""},
+            ]}]}, "重复前置分支"),
+        ({"name": "x", "members": [sd], "gates": [{
+            "id": "g", "target_session": sd, "target_stage": "t1",
+            "prerequisites": []}]}, "空前置被拒"),
+        ({"name": "x", "members": [sd, su], "gates": [{
+            "id": "g", "target_session": su, "target_stage": "s1",
+            "prerequisites": [{"session_id": sd, "stage_id": "t1",
+                               "kind": "next_stage", "value": "t2"},
+                              {"session_id": su, "stage_id": "s1",
+                               "kind": "next_stage", "value": "s2"}]}]}, "有环被拒"),
+    ]
+    for raw, label in bad_cases:
+        try:
+            await jo.validate_spec(raw)
+            check(f"校验拒绝：{label}", False)
+        except JointError:
+            check(f"校验拒绝：{label}", True)
+
+    # ------------------------------------------------------------------ #
+    # happy path: AND join, one-shot delivery, role-permission trimming
+    # ------------------------------------------------------------------ #
+    await eng.join(sd, "BBB", "下游乙")
+    await eng.join(sd, "XXX", "旁观者")
+    await eng.start(sd)  # target session already at t1
+    jid = (await jo.create_joint(base_spec))["id"]
+    detail = await jo.get_joint(jid)
+    check("新联演门禁等待中", detail["gates"][0]["status"] == WAITING
+          and detail["gates"][0]["ready"] is False)
+    check("阻塞原因含等待分支", "等待 2 个分支" in detail["gates"][0]["block_reason"])
+
+    await eng.join(su, "AAA", "上游甲")
+    await eng.start(su)
+    await eng.submit(su, "a", "s1", "go")  # default_next s2
+    await jo.reconcile_session(su)
+    detail = await jo.get_joint(jid)
+    sat = [p["satisfied"] for p in detail["gates"][0]["prerequisites"]]
+    check("首个分支满足、整体仍等待", sat == [True, False])
+    _, d_down, st_down = await eng.load(sd)
+    snap_b = build_snapshot(
+        await eng.get_session(sd), d_down, st_down, ("role", "b"))
+    check("未释放前参与者快照无注入",
+          all(not h.get("injections") for h in snap_b["history"]))
+
+    await eng.join(su2, "CCC", "上游丙")
+    await eng.start(su2)
+    await eng.submit(su2, "c", "s1", "go")
+    delivered = await jo.reconcile_session(su2)
+    check("AND 汇合后注入投递到目标会话", delivered == {sd})
+    detail = await jo.get_joint(jid)
+    check("门禁状态 released", detail["gates"][0]["status"] == RELEASED
+          and detail["gates"][0]["event_version"] is not None)
+
+    # Idempotency: repeated/out-of-order reconciliation never re-delivers.
+    check("重复仲裁不重复投递", await jo.reconcile_session(su) == set())
+    check("再次仲裁不重复投递", await jo.reconcile_session(su2) == set())
+    dup = await eng.append_injection(
+        sd, f"inj_{jid}_g1", jid, "g1", "t1", "联动请求", "请配合关阀",
+        {"b": "乙的专属联演情报"})
+    check("同一注入重复追加被幂等拒绝", dup == {"delivered": False, "reason": "duplicate"})
+    rows = await eng.db.all(
+        "SELECT COUNT(*) AS n FROM events WHERE session_id=? AND type='joint_injection'",
+        (sd,))
+    check("目标会话仅有一条注入事件", rows[0]["n"] == 1)
+    check_log("目标会话日志分配规则一致", await fetch_events(eng.db, sd))
+
+    # The injection is in the TARGET session's independent event stream; the
+    # upstream sessions know nothing about it.
+    for other in (su, su2):
+        n = await eng.db.one(
+            "SELECT COUNT(*) AS n FROM events WHERE session_id=? AND type='joint_injection'",
+            (other,))
+        check(f"上游会话 {other} 事件记录保持独立", n["n"] == 0)
+
+    # Permission trimming.
+    _, d_down, st_down = await eng.load(sd)
+    sess_down = await eng.get_session(sd)
+    sb = build_snapshot(sess_down, d_down, st_down, ("role", "b"))
+    sx = build_snapshot(sess_down, d_down, st_down, ("role", "x"))
+    sh = build_snapshot(sess_down, d_down, st_down, ("host", None))
+    inj_b = sb["history"][0]["injections"]
+    inj_x = sx["history"][0]["injections"]
+    check("目标角色看到公开+私有注入",
+          inj_b and inj_b[0]["public"] == "请配合关阀" and inj_b[0]["private"] == "乙的专属联演情报")
+    check("无关角色只见公开注入、无私有文本",
+          inj_x and inj_x[0]["private"] == ""
+          and "乙的专属联演情报" not in json.dumps(sx, ensure_ascii=False))
+    check("主持人快照可见全部角色注入视图",
+          sh["history"][0]["injections"][0]["views"] == {"b": "乙的专属联演情报"})
+
+    # next_stage outcome + ready-before-open ordering on a second joint.
+    sd2 = await eng.create_session("jdown")
+    spec2 = {
+        "name": "跳转结局联演", "members": [su, sd2],
+        "gates": [{
+            "id": "h1", "target_session": sd2, "target_stage": "t1",
+            "title": "注入二", "public": "公开二",
+            "prerequisites": [{"session_id": su, "stage_id": "s1",
+                               "kind": "next_stage", "value": "s2"}],
+        }],
+    }
+    jid2 = (await jo.create_joint(spec2))["id"]
+    d2 = await jo.get_joint(jid2)
+    # su already sealed s1 -> s2 earlier; creation sweep should observe it,
+    # but sd2 is not started, so ready-but-waiting.
+    check("前置先满足时门禁就绪等待目标阶段",
+          d2["gates"][0]["ready"] is True and d2["gates"][0]["status"] == WAITING)
+    check("阻塞原因提示等待阶段开放", "等待会话进入阶段" in d2["gates"][0]["block_reason"])
+    await eng.join(sd2, "BBB", "乙二")
+    await eng.start(sd2)
+    delivered = await jo.reconcile_session(sd2)
+    check("目标阶段开放后释放", delivered == {sd2})
+
+    # Outcome mismatch: stop ends the drill; a next_stage->s2 gate stays.
+    su3 = await eng.create_session("jup")
+    sd3 = await eng.create_session("jdown")
+    await eng.join(su3, "AAA", "甲"); await eng.join(sd3, "BBB", "乙")
+    await eng.start(su3); await eng.start(sd3)
+    spec3 = {
+        "name": "结局不符联演", "members": [su3, sd3],
+        "gates": [{
+            "id": "h2", "target_session": sd3, "target_stage": "t1",
+            "public": "x",
+            "prerequisites": [{"session_id": su3, "stage_id": "s1",
+                               "kind": "next_stage", "value": "s2"}],
+        }],
+    }
+    jid3 = (await jo.create_joint(spec3))["id"]
+    await eng.submit(su3, "a", "s1", "stop")  # transition next=None -> ends
+    await jo.reconcile_session(su3)
+    check("结局不符不满足分支",
+          all(not p["satisfied"] for p in (await jo.get_joint(jid3))["gates"][0]["prerequisites"]))
+    # Target stage seals before the gate can release -> missed, no retro-deliver.
+    await eng.settle(sd3, "host")
+    await jo.reconcile_session(sd3)
+    check("目标阶段先结算记为错过",
+          (await jo.get_joint(jid3))["gates"][0]["status"] == MISSED)
+    n = await eng.db.one(
+        "SELECT COUNT(*) AS n FROM events WHERE session_id=? AND type='joint_injection'",
+        (sd3,))
+    check("错过的门禁不投递任何注入", n["n"] == 0)
+
+    # Frozen gate cannot be modified; a waiting gate can.
+    try:
+        await jo.replace_joint(jid3, {
+            "name": "结局不符联演改", "members": [su3, sd3], "gates": [{
+                "id": "h2", "target_session": sd3, "target_stage": "t1",
+                "public": "CHANGED",
+                "prerequisites": [{"session_id": su3, "stage_id": "s1",
+                                   "kind": "next_stage", "value": "s2"}],
+            }]})
+        check("已错过门禁修改被拒", False)
+    except JointError as exc:
+        check("已错过门禁修改被拒（409）", exc.status == 409)
+    try:
+        await jo.delete_joint(jid)
+        check("含已投递门禁的联演删除被拒", False)
+    except JointError as exc:
+        check("含已投递门禁的联演删除被拒（409）", exc.status == 409)
+
+    # Replay determinism of an injected session includes the injection frame.
+    sess_d, def_d, _ = await eng.load(sd)
+    rows = await eng.db.all(
+        "SELECT version, seq, type, actor, at, payload FROM events "
+        "WHERE session_id=? ORDER BY version, seq", (sd,))
+    replay = build_replay(sess_d, def_d, load_events(rows), ("host", ""))
+    dump = json.dumps(replay, ensure_ascii=False)
+    check("回放含注入事件标签", "联演注入追加到阶段" in dump)
+    check("回放帧包含注入快照", "请配合关阀" in dump)
+    last = replay["frames"][-1]["snapshot"]
+    check("末帧快照携带注入", last["history"][0]["injections"])
+
+
+async def test_cross_session_write_serialization(eng):
+    print("[13b] 跨会话写事务在共享连接上串行化")
+    # Two DIFFERENT sessions hold two different session locks; their write
+    # coroutines interleave at awaits but must never corrupt the shared
+    # SQLite connection ("cannot start a transaction within a transaction").
+    su = await eng.create_session("jup")
+    sd = await eng.create_session("jdown")
+
+    async def drive(sid, invite):
+        await eng.join(sid, invite, "n")
+        r = await eng.start(sid)
+        return r
+
+    for _ in range(5):
+        su = await eng.create_session("jup")
+        sd = await eng.create_session("jdown")
+        results = await asyncio.gather(
+            drive(su, "AAA"), drive(sd, "BBB"), return_exceptions=True)
+        check("并发跨会话 start 均成功",
+              all(not isinstance(r, Exception) for r in results), str(results))
+        check_log("会话一日志一致", await fetch_events(eng.db, su))
+        check_log("会话二日志一致", await fetch_events(eng.db, sd))
+        await eng.end_session(su)
+        await eng.end_session(sd)
+
+
 async def engine_tests():
     db = Database(str(Path(_TMP) / "t.db"))
     await db.connect()
     eng = Engine(db)
-    for dct in (DUEL, FAST, TIMED2):
+    for dct in (DUEL, FAST, TIMED2, JUP, JDOWN, JUP2):
         d = parse_definition(yaml.safe_load(yaml.safe_dump(dct)))
         # Unknown drills seed as an immediately released v1.
         await eng.seed_from_file(d, yaml.safe_dump(dct, allow_unicode=True, sort_keys=False))
@@ -1244,17 +1750,20 @@ async def engine_tests():
         await test_replay(eng)
         await test_end_session(eng)
         await test_script_versions(eng)
+        await test_joint_orchestration(eng)
+        await test_cross_session_write_serialization(eng)
     finally:
         await db.close()
 
 
 def main():
-    signal.alarm(240)  # watchdog: a hung websocket read must not block CI
+    signal.alarm(360)  # watchdog: a hung websocket read must not block CI
     test_definitions()
     asyncio.run(engine_tests())
     asyncio.run(_migration_test())
     test_http_ws_e2e()
     test_http_version_api()
+    test_joint_http_ws()
     print(f"\n{'全部通过' if FAIL == 0 else '存在失败'}: {PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

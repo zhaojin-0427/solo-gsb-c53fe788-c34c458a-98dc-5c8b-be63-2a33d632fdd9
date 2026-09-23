@@ -11,6 +11,7 @@ from typing import Any
 
 from .definitions import DrillDef
 from .engine import (
+    E_JOINT_INJECTION,
     E_PARTICIPANT_JOINED,
     E_SESSION_ENDED,
     E_SESSION_STARTED,
@@ -118,6 +119,12 @@ def _change(ev: dict[str, Any], d: DrillDef) -> dict[str, Any]:
     elif t == E_SESSION_ENDED:
         base["label"] = f"演练结束（{REASON_LABELS.get(p['reason'], p['reason'])}）"
         base["reason"] = p["reason"]
+    elif t == E_JOINT_INJECTION:
+        base["label"] = f"联演注入追加到阶段「{p.get('stage_id')}」：{p.get('title') or '（无标题）'}"
+        base["stage_id"] = p["stage_id"]
+        base["joint_id"] = p.get("joint_id")
+        base["gate_id"] = p.get("gate_id")
+        base["injection_id"] = p.get("injection_id")
     return base
 
 
@@ -159,6 +166,22 @@ def personal_record(
             and sealed.choices.get(role_id) is None,
             "settled_reason": sealed.reason if sealed else None,
             "next_stage": sealed.next if sealed else None,
+            # Joint injections are part of THIS session's own event record;
+            # only the public text + the viewer's own private view appear.
+            "joint_injections": [
+                {
+                    "injection_id": inj.injection_id,
+                    "joint_id": inj.joint_id,
+                    "gate_id": inj.gate_id,
+                    "title": inj.title,
+                    "public": inj.public,
+                    "my_view": inj.views.get(role_id, ""),
+                    "at": inj.at,
+                    "version": inj.version,
+                }
+                for inj in sorted(st.injections.values(), key=lambda i: (i.at, i.injection_id))
+                if inj.stage_id == sid
+            ],
         }
         stages_out.append(entry)
 
@@ -219,6 +242,20 @@ def host_record(
                 ],
                 "default_next": stage.default_next,
                 "choices": choices,
+                "joint_injections": [
+                    {
+                        "injection_id": inj.injection_id,
+                        "joint_id": inj.joint_id,
+                        "gate_id": inj.gate_id,
+                        "title": inj.title,
+                        "public": inj.public,
+                        "views": dict(inj.views),
+                        "at": inj.at,
+                        "version": inj.version,
+                    }
+                    for inj in sorted(st.injections.values(), key=lambda i: (i.at, i.injection_id))
+                    if inj.stage_id == sid
+                ],
                 "sealed": {
                     "reason": sealed.reason,
                     "reason_label": REASON_LABELS.get(sealed.reason, sealed.reason),
@@ -301,6 +338,15 @@ def render_personal_md(rec: dict[str, Any]) -> str:
                 lines += ["**我的决定：** ⏱ 未在截止前提交（超时）", ""]
             elif s["my_choice"]:
                 lines += [f"**我的决定：** {_md_escape(s['my_choice_label'])}", ""]
+        for inj in s.get("joint_injections", []):
+            lines += [
+                "### 🔗 联演注入：" + _md_escape(inj["title"]),
+                "",
+                f"公开信息：{_md_escape(inj['public'])}",
+                "",
+            ]
+            if inj["my_view"]:
+                lines += [f"本角色可见：{_md_escape(inj['my_view'])}", ""]
         if s["settled_reason"]:
             lines += [
                 f"*结算方式：{REASON_LABELS.get(s['settled_reason'], s['settled_reason'])}*",
@@ -372,6 +418,15 @@ def render_host_md(rec: dict[str, Any]) -> str:
                     lines.append(f"- {rname}: ⏱ 超时未提交")
                 else:
                     lines.append(f"- {rname}: {_md_escape(c['label'] or c['choice_id'])}")
+            lines.append("")
+        for inj in s.get("joint_injections", []):
+            lines += [
+            f"### 🔗 联演注入（v{inj['version']}）：{_md_escape(inj['title'])}",
+            "",
+            f"公开信息：{_md_escape(inj['public'])}",
+            ]
+            for rid, text in inj["views"].items():
+                lines.append(f"- 仅 {_role_name(rec, rid)} 可见：{_md_escape(text)}")
             lines.append("")
         if s["sealed"]:
             lines += [

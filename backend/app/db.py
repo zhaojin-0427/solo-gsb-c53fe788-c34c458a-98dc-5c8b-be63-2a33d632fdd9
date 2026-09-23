@@ -9,6 +9,7 @@ Concurrency model
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import time
@@ -96,6 +97,83 @@ CREATE TABLE IF NOT EXISTS submissions (
     at         TEXT NOT NULL,
     PRIMARY KEY (session_id, stage_id, role_id)
 );
+
+-- ---------------------------------------------------------------------------
+-- Joint exercise orchestration ("联合演练编排"): several independent sessions
+-- are grouped into one joint drill; gates carry directed stage dependencies.
+-- A gate releases a one-shot injection into its target session only after
+-- EVERY prerequisite branch has observed its specified outcome (AND join).
+-- The delivered injection itself is appended to the TARGET session's own
+-- event log (a joint_injection event), so each session keeps its pinned
+-- script version and its independent, deterministic event record.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS joints (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS joint_members (
+    joint_id   TEXT NOT NULL REFERENCES joints(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    ord        INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (joint_id, session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_joint_members_session
+    ON joint_members(session_id);
+
+-- One gate = one one-shot injection targeting one stage of one session.
+-- status: waiting (prerequisites not all met / target stage not yet open) |
+--         released (delivered exactly once) | missed (target stage sealed
+--         or session ended before release — the delivery window is gone).
+CREATE TABLE IF NOT EXISTS joint_gates (
+    joint_id       TEXT NOT NULL REFERENCES joints(id) ON DELETE CASCADE,
+    gate_id        TEXT NOT NULL,
+    target_session TEXT NOT NULL,
+    target_stage   TEXT NOT NULL,
+    title          TEXT NOT NULL DEFAULT '',
+    public_text    TEXT NOT NULL DEFAULT '',
+    views          TEXT NOT NULL DEFAULT '{}',  -- role_id -> private text (JSON)
+    status         TEXT NOT NULL DEFAULT 'waiting',
+    delivered_at   TEXT,
+    event_version  INTEGER,                      -- session version of the injection
+    PRIMARY KEY (joint_id, gate_id)
+);
+CREATE INDEX IF NOT EXISTS idx_joint_gates_lookup
+    ON joint_gates(target_session, target_stage, status);
+CREATE INDEX IF NOT EXISTS idx_joint_gates_joint
+    ON joint_gates(joint_id, status);
+
+-- A prerequisite branch: "(session, stage) must reach the specified outcome".
+-- kind 'next_stage': the sealed stage's resolved next must equal ``value``
+--                    ('' denotes the drill ending, next == None);
+-- kind 'choice':     ``role_id``'s sealed choice must equal ``value``.
+CREATE TABLE IF NOT EXISTS joint_branches (
+    joint_id   TEXT NOT NULL,
+    gate_id    TEXT NOT NULL,
+    branch_no  INTEGER NOT NULL,
+    session_id TEXT NOT NULL,
+    stage_id   TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    role_id    TEXT NOT NULL DEFAULT '',
+    value      TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (joint_id, gate_id, branch_no)
+);
+CREATE INDEX IF NOT EXISTS idx_joint_branches_watch
+    ON joint_branches(session_id, stage_id);
+
+-- A branch is recorded at most once (one-shot): the PK makes duplicate /
+-- out-of-order observation idempotent.
+CREATE TABLE IF NOT EXISTS joint_branch_hits (
+    joint_id      TEXT NOT NULL,
+    gate_id       TEXT NOT NULL,
+    branch_no     INTEGER NOT NULL,
+    event_version INTEGER NOT NULL,
+    at            TEXT NOT NULL,
+    PRIMARY KEY (joint_id, gate_id, branch_no)
+);
 """
 
 
@@ -107,10 +185,25 @@ class Database:
     def __init__(self, path: str):
         self.path = path
         self.db: aiosqlite.Connection | None = None
+        # All writers share ONE underlying SQLite connection, and Python's
+        # sqlite3 opens transactions implicitly before DML. Per-session locks
+        # guard each session's invariants, but two DIFFERENT sessions (or a
+        # session and the joint orchestrator) can hold different session locks
+        # and interleave at an await in the middle of their transactions.
+        # This lock serialises the SQL transaction boundary itself so one
+        # transaction's begin..commit is never interleaved with another's.
+        self._write_lock = asyncio.Lock()
+        self._tx_owner: asyncio.Task | None = None
+
+    def write_lock(self) -> asyncio.Lock:
+        return self._write_lock
 
     async def connect(self) -> None:
-        self.db = await aiosqlite.connect(self.path)
+        self.db = await aiosqlite.connect(self.path, isolation_level=None)
         self.db.row_factory = aiosqlite.Row
+        # isolation_level=None puts the connection in SQLite autocommit mode,
+        # so transactions are opened ONLY by our explicit BEGIN IMMEDIATE and
+        # no implicit DML transaction can leak across an await.
         await self.db.execute("PRAGMA journal_mode=WAL")
         await self.db.execute("PRAGMA foreign_keys=ON")
         await self.db.execute("PRAGMA busy_timeout=5000")
@@ -124,13 +217,35 @@ class Database:
 
     # ---------- low level helpers (connection in autocommit mode) ----------
     async def begin(self) -> None:
-        await self.db.execute("BEGIN IMMEDIATE")
+        # Acquire the connection-wide write lock for the duration of the
+        # transaction; released by commit()/rollback(). This serialises the
+        # SQL of transactions that belong to different session locks.
+        await self._write_lock.acquire()
+        self._tx_owner = asyncio.current_task()
+        try:
+            await self.db.execute("BEGIN IMMEDIATE")
+        except Exception:
+            self._tx_owner = None
+            self._write_lock.release()
+            raise
+
+    async def _end_tx(self, action) -> None:
+        owner = getattr(self, "_tx_owner", None)
+        try:
+            await action()
+        finally:
+            # Only the task that opened this transaction releases the lock,
+            # so a stray commit on an idle connection never unlocks another
+            # coroutine's in-flight transaction.
+            if owner is not None and owner is asyncio.current_task():
+                self._tx_owner = None
+                self._write_lock.release()
 
     async def commit(self) -> None:
-        await self.db.commit()
+        await self._end_tx(self.db.commit)
 
     async def rollback(self) -> None:
-        await self.db.rollback()
+        await self._end_tx(self.db.rollback)
 
     async def all(self, sql: str, params: tuple = ()) -> list[aiosqlite.Row]:
         async with self.db.execute(sql, params) as cur:

@@ -48,6 +48,10 @@ E_STAGE_CHOICE = "stage_choice"
 E_STAGE_SEALED = "stage_sealed"
 E_STAGE_OPENED = "stage_opened"
 E_SESSION_ENDED = "session_ended"
+# A one-shot joint-exercise injection appended to the TARGET session's own
+# event log by the orchestrator. It occupies a normal monotonic version, so
+# every session keeps an independent, deterministically replayable record.
+E_JOINT_INJECTION = "joint_injection"
 
 
 class EngineError(Exception):
@@ -124,6 +128,20 @@ class SealedStage:
 
 
 @dataclass
+class Injection:
+    """A joint-exercise injection delivered into this session."""
+    injection_id: str
+    joint_id: str
+    gate_id: str
+    stage_id: str
+    title: str
+    public: str
+    views: dict[str, str] = field(default_factory=dict)  # role_id -> private text
+    version: int = 0
+    at: float = 0.0
+
+
+@dataclass
 class State:
     status: str = "created"  # created|running|ended
     end_reason: str | None = None
@@ -136,6 +154,9 @@ class State:
     sealed: dict[str, SealedStage] = field(default_factory=dict)
     order: list[str] = field(default_factory=list)
     roster: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # joint_injection event payloads keyed by injection id; the dict shape is
+    # reconstructed by reduce_events for deterministic replay/equality.
+    injections: dict[str, Injection] = field(default_factory=dict)
 
 
 def reduce_events(events: list[dict[str, Any]]) -> State:
@@ -176,6 +197,18 @@ def reduce_events(events: list[dict[str, Any]]) -> State:
             st.ended_at = p["at"]
             st.current = None
             st.deadline = None
+        elif t == E_JOINT_INJECTION:
+            st.injections[p["injection_id"]] = Injection(
+                injection_id=p["injection_id"],
+                joint_id=p.get("joint_id", ""),
+                gate_id=p.get("gate_id", ""),
+                stage_id=p["stage_id"],
+                title=p.get("title", ""),
+                public=p.get("public", ""),
+                views=dict(p.get("views", {})),
+                version=ev["version"],
+                at=p["at"],
+            )
     return st
 
 
@@ -983,6 +1016,89 @@ class Engine:
                 await self._finalize_session_row(session_id, state)
                 await self.db.commit()
                 return {"ended": True, "ended_at": state.ended_at}
+            except Exception:
+                await self.db.rollback()
+                raise
+
+    # ------------------------------------------------------------------ #
+    # joint-exercise injections
+    # ------------------------------------------------------------------ #
+    async def append_injection(
+        self,
+        session_id: str,
+        injection_id: str,
+        joint_id: str,
+        gate_id: str,
+        stage_id: str,
+        title: str,
+        public_text: str,
+        views: dict[str, str],
+    ) -> dict[str, Any]:
+        """Atomically append a one-shot joint injection to a session.
+
+        The same safety rules as a normal state change apply:
+
+        * the session lock serialises it against submissions/settles, so the
+          check "stage still open" and the event insert are one atomic
+          transaction — an injection can never unlock a stage that sealed
+          first and can never be delivered twice;
+        * the injection occupies exactly one new monotonic version, keeping
+          the target session's event log independent and replayable;
+        * ``views`` are permission-trimmed by the snapshot builder exactly
+          like ordinary stage views.
+
+        Returns ``{"delivered": True, ...}`` or
+        ``{"delivered": False, "reason": "ended"|"stage_closed"|"duplicate"}``.
+        """
+        async with self.lock_for(session_id):
+            await self.db.begin()
+            try:
+                sess, d, state = await self.load(session_id)
+                if injection_id in state.injections:
+                    await self.db.commit()
+                    return {"delivered": False, "reason": "duplicate"}
+                if sess["status"] != "running" or state.current != stage_id:
+                    await self.db.commit()
+                    return {
+                        "delivered": False,
+                        "reason": "stage_closed",
+                        "current": state.current,
+                        "status": sess["status"],
+                    }
+                ts = now_ts()
+                version = state.last_version + 1
+                payload = {
+                    "injection_id": injection_id,
+                    "joint_id": joint_id,
+                    "gate_id": gate_id,
+                    "stage_id": stage_id,
+                    "title": title,
+                    "public": public_text,
+                    "views": views,
+                    "at": ts,
+                }
+                await self._insert_event(
+                    session_id, version, 0, E_JOINT_INJECTION, "joint", payload
+                )
+                state.injections[injection_id] = Injection(
+                    injection_id=injection_id,
+                    joint_id=joint_id,
+                    gate_id=gate_id,
+                    stage_id=stage_id,
+                    title=title,
+                    public=public_text,
+                    views=dict(views),
+                    version=version,
+                    at=ts,
+                )
+                state.last_version = version
+                await self.db.commit()
+                return {
+                    "delivered": True,
+                    "version": version,
+                    "at": ts,
+                    "stage_id": stage_id,
+                }
             except Exception:
                 await self.db.rollback()
                 raise

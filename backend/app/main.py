@@ -29,6 +29,7 @@ from .db import Database
 from .definitions import DrillError, load_file
 from .engine import Engine, EngineError, now_ts
 from .hub import Client, Hub
+from .joints import JointError, JointOrchestrator
 from .records import (
     build_replay,
     host_record,
@@ -79,6 +80,23 @@ db = Database(str(config.DB_PATH))
 engine = Engine(db)
 hub = Hub()
 timers = TimerService()
+joints = JointOrchestrator(db, engine)
+
+
+async def reconcile_and_broadcast(session_id: str) -> None:
+    """After any session state change, sweep the joint orchestration:
+    record satisfied branches, release due one-shot injections into their
+    target sessions and push refreshed permission-trimmed snapshots to the
+    sessions that changed (the originating session is broadcast by its own
+    caller path; injections may land in *other* member sessions)."""
+    try:
+        delivered = await joints.reconcile_session(session_id)
+    except Exception as exc:
+        print(f"[joint] reconcile failed for {session_id}: {exc}")
+        return
+    for other in delivered:
+        if other != session_id:
+            await broadcast_snapshot(other)
 
 
 def check_host(key: str | None) -> None:
@@ -127,6 +145,7 @@ async def on_deadline(session_id: str, expected_deadline: float) -> None:
     if not info.get("noop"):
         await broadcast_snapshot(session_id)
         await reschedule(session_id)
+        await reconcile_and_broadcast(session_id)
 
 
 def parse_yaml_body(yaml_text: str):
@@ -180,6 +199,10 @@ async def lifespan(app: FastAPI):
                 continue
             if state.current is not None:
                 timers.schedule(s["id"], state.deadline)
+    # Restart recovery for joint orchestration: re-evaluate every gate so
+    # injections whose branches were met while the server was down are
+    # delivered (or marked missed) without duplicating any prior delivery.
+    await joints.reconcile_all()
     try:
         yield
     finally:
@@ -211,6 +234,60 @@ class PublishBody(BaseModel):
 class CopyBody(BaseModel):
     source_version: int
     base_version: int | None = None
+
+
+class JointPrereq(BaseModel):
+    session_id: str
+    stage_id: str
+    kind: str  # next_stage | choice
+    role_id: str | None = None
+    value: str | None = None
+
+
+class JointGate(BaseModel):
+    id: str | None = None
+    target_session: str
+    target_stage: str
+    title: str | None = None
+    public: str = ""
+    views: dict[str, str] | None = None
+    prerequisites: list[JointPrereq]
+
+
+class JointBody(BaseModel):
+    name: str
+    description: str | None = ""
+    members: list[str]
+    gates: list[JointGate] | None = None
+
+
+def _joint_payload(body: JointBody) -> dict[str, Any]:
+    return {
+        "name": body.name,
+        "description": body.description or "",
+        "members": body.members,
+        "gates": [
+            {
+                "id": g.id,
+                "target_session": g.target_session,
+                "target_stage": g.target_stage,
+                "title": g.title or "",
+                "public": g.public,
+                "views": g.views or {},
+                "prerequisites": [
+                    {
+                        "session_id": p.session_id,
+                        "stage_id": p.stage_id,
+                        "kind": p.kind,
+                        "role_id": p.role_id or "",
+                        "value": "" if p.value is None else p.value,
+                    }
+                    for p in g.prerequisites
+                ],
+            }
+            for g in (body.gates or [])
+        ],
+    }
 
 
 @app.get("/api/health")
@@ -447,6 +524,88 @@ async def api_record(
 
 
 # --------------------------------------------------------------------------- #
+# Joint exercise orchestration API (host only)
+# --------------------------------------------------------------------------- #
+@app.get("/api/joints")
+async def api_joints(x_host_key: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    check_host(x_host_key)
+    return await joints.list_joints()
+
+
+@app.post("/api/joints", status_code=201)
+async def api_create_joint(
+    body: JointBody, x_host_key: str | None = Header(default=None)
+) -> dict[str, Any]:
+    check_host(x_host_key)
+    try:
+        return await joints.create_joint(_joint_payload(body))
+    except JointError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+
+@app.get("/api/joints/{joint_id}")
+async def api_get_joint(
+    joint_id: str, x_host_key: str | None = Header(default=None)
+) -> dict[str, Any]:
+    check_host(x_host_key)
+    try:
+        return await joints.get_joint(joint_id)
+    except JointError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+
+@app.put("/api/joints/{joint_id}")
+async def api_replace_joint(
+    joint_id: str,
+    body: JointBody,
+    x_host_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    check_host(x_host_key)
+    try:
+        return await joints.replace_joint(joint_id, _joint_payload(body))
+    except JointError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+
+@app.delete("/api/joints/{joint_id}")
+async def api_delete_joint(
+    joint_id: str, x_host_key: str | None = Header(default=None)
+) -> dict[str, bool]:
+    check_host(x_host_key)
+    try:
+        await joints.delete_joint(joint_id)
+    except JointError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    return {"ok": True}
+
+
+@app.get("/api/sessions/{session_id}/joints")
+async def api_session_joints(
+    session_id: str, x_host_key: str | None = Header(default=None)
+) -> list[dict[str, Any]]:
+    """Joint branch status for one session's host console (waiting state and
+    blocking reasons)."""
+    check_host(x_host_key)
+    try:
+        await engine.get_session(session_id)
+        return await joints.joints_for_session(session_id)
+    except EngineError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+
+@app.get("/api/sessions/{session_id}/script")
+async def api_session_script(
+    session_id: str, x_host_key: str | None = Header(default=None)
+) -> dict[str, Any]:
+    """Pinned script reference (stages/roles/options) for the joint editor."""
+    check_host(x_host_key)
+    try:
+        return await joints.session_script(session_id)
+    except JointError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+
+# --------------------------------------------------------------------------- #
 # WebSocket: /ws/{session_id}?token=...&host=...
 # --------------------------------------------------------------------------- #
 @app.websocket("/ws/{session_id}")
@@ -538,6 +697,7 @@ async def _handle_ws_message(
             hub.push_to(client, {"type": "submit_result", **result})
             await broadcast_snapshot(session_id)
             await reschedule(session_id)
+            await reconcile_and_broadcast(session_id)
             return
 
         hub.push_to(client, {"type": "error", "code": "unknown_type", "detail": mtype})
@@ -557,6 +717,7 @@ async def _handle_host_message(session_id: str, raw: dict[str, Any]) -> None:
         return
     await broadcast_snapshot(session_id)
     await reschedule(session_id)
+    await reconcile_and_broadcast(session_id)
 
 
 # --------------------------------------------------------------------------- #

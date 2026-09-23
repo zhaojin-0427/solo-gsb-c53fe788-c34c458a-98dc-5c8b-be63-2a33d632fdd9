@@ -6,13 +6,17 @@ A participant snapshot contains only:
   stage reached, never other roles' private views or unannounced option text)
 The presenter snapshot additionally contains every role's view, every choice,
 the raw definition and the full event log.
+
+Joint-exercise injections (``joint_injection`` events) follow the same
+permission model: the injection's public text goes to everyone watching the
+stage, each role-specific view only to that role.
 """
 from __future__ import annotations
 
 from typing import Any
 
 from .definitions import DrillDef, Stage
-from .engine import State
+from .engine import Injection, State
 
 REASON_LABELS = {
     "complete": "全部提交，自动结算",
@@ -33,6 +37,32 @@ def _choice_label(stage: Stage, role_id: str, choice_id: str | None) -> str | No
         if o.id == choice_id:
             return o.text
     return choice_id
+
+
+def _injection_view(inj: Injection, role_id: str | None, host: bool) -> dict[str, Any]:
+    """Permission-trimmed view of one delivered joint injection."""
+    out: dict[str, Any] = {
+        "injection_id": inj.injection_id,
+        "joint_id": inj.joint_id,
+        "gate_id": inj.gate_id,
+        "stage_id": inj.stage_id,
+        "title": inj.title,
+        "public": inj.public,
+        "version": inj.version,
+        "at": _iso(inj.at),
+    }
+    if host:
+        out["views"] = dict(inj.views)
+    elif role_id is not None:
+        out["private"] = inj.views.get(role_id, "")
+    return out
+
+
+def _injections_for(state: State, stage_id: str) -> list[Injection]:
+    return [
+        inj for inj in state.injections.values()
+        if inj.stage_id == stage_id
+    ]
 
 
 def _block_base(stage: Stage, state: State) -> dict[str, Any]:
@@ -68,6 +98,10 @@ def _role_history_block(stage: Stage, state: State, role_id: str) -> dict[str, A
     sealed = state.sealed.get(stage.id)
     if sealed:
         block["next"] = sealed.next
+    block["injections"] = [
+        _injection_view(inj, role_id, host=False)
+        for inj in sorted(_injections_for(state, stage.id), key=lambda i: (i.at, i.injection_id))
+    ]
     return block
 
 
@@ -103,6 +137,10 @@ def _host_history_block(stage: Stage, state: State) -> dict[str, Any]:
     block["transitions"] = [{"when": t.when, "next": t.next} for t in stage.transitions]
     block["default_next"] = stage.default_next
     block["reached"] = _reached(stage, state)
+    block["injections"] = [
+        _injection_view(inj, None, host=True)
+        for inj in sorted(_injections_for(state, stage.id), key=lambda i: (i.at, i.injection_id))
+    ]
     return block
 
 

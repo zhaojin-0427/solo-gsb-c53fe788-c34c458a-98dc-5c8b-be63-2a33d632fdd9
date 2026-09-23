@@ -172,3 +172,28 @@ label select { display: block; margin-top: 4px; min-width: 220px; }
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: .82rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
 }
+
+/* ---- joint exercise orchestration ---- */
+.joint-members table { font-size: .85rem; }
+.gate { border-left: 4px solid #314070; }
+.gate.frozen { border-left-color: var(--border); opacity: .92; }
+.gate .g-id-chip { font-size: .76rem; }
+.branches { margin: 6px 0; }
+.branch-row { margin: 8px 0; background: var(--panel); }
+.branch-row label { margin: 0 8px 0 0; }
+.branch-row select { min-width: 160px; }
+.branch-list { list-style: none; padding: 0; margin: 8px 0 0; }
+.branch-list li { display: flex; gap: 8px; align-items: baseline; margin: 4px 0; flex-wrap: wrap; }
+.branch-met { color: var(--ok); }
+.branch-waiting { color: var(--warn); }
+.branch-line { margin: 8px 0; padding: 8px 10px; border: 1px solid var(--border);
+  border-radius: 8px; background: var(--panel-2); }
+.gate-mon.released { border-left: 4px solid var(--ok); }
+.gate-mon.missed { border-left: 4px solid var(--danger); }
+.gate-mon.waiting { border-left: 4px solid var(--warn); }
+.block-reason { color: #f2b8b8; background: #331d20; border: 1px solid #5c2a2e;
+  border-radius: 8px; padding: 6px 10px; margin: 8px 0 0; font-size: .85rem; }
+.box.injection { border-color: #314070; background: #171f33; }
+.box.injection .injection-title { font-weight: 700; }
+.g-views label { display: block; margin-top: 8px; }
+#joint-panel .chip { font-size: .76rem; }
