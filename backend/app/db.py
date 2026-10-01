@@ -96,6 +96,77 @@ CREATE TABLE IF NOT EXISTS submissions (
     at         TEXT NOT NULL,
     PRIMARY KEY (session_id, stage_id, role_id)
 );
+
+-- ---------------------------------------------------------------------------
+-- Joint exercise orchestration ("联演"): several independent sessions are
+-- enrolled into one joint; directed stage dependencies fire a *one-shot*
+-- joint injection into a target session's stage once ALL prerequisite
+-- branches (upstream stage outcomes) have been met.
+--
+-- Every member session keeps its own pinned script version and its own event
+-- log; a fired injection is simply a new event version inside the TARGET
+-- session. The ledger tables below are the only cross-session state:
+--   joint_hits       one row per satisfied branch      -> AND barrier
+--   joint_deliveries one row per fired rule (rule_id PK) -> exactly-once
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS joints (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS joint_sessions (
+    joint_id   TEXT NOT NULL REFERENCES joints(id),
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    added_at   TEXT NOT NULL,
+    PRIMARY KEY (joint_id, session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_joint_sessions_session
+    ON joint_sessions(session_id);
+
+CREATE TABLE IF NOT EXISTS joint_rules (
+    id                TEXT PRIMARY KEY,
+    joint_id          TEXT NOT NULL REFERENCES joints(id),
+    target_session_id TEXT NOT NULL,
+    target_stage_id   TEXT NOT NULL,
+    inject_json       TEXT NOT NULL,   -- {title, public, views:{role_id:text}}
+    row_seq           INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_joint_rules_joint ON joint_rules(joint_id);
+
+CREATE TABLE IF NOT EXISTS joint_branches (
+    rule_id           TEXT NOT NULL REFERENCES joint_rules(id),
+    idx               INTEGER NOT NULL,
+    source_session_id TEXT NOT NULL,
+    source_stage_id   TEXT NOT NULL,
+    outcome           TEXT NOT NULL,   -- target stage id, or '@end' (= sealed next IS NULL)
+    PRIMARY KEY (rule_id, idx)
+);
+
+-- Satisfaction ledger. The composite primary key makes a repeated or
+-- out-of-order signal for the same branch an idempotent no-op.
+CREATE TABLE IF NOT EXISTS joint_hits (
+    rule_id           TEXT NOT NULL,
+    idx               INTEGER NOT NULL,
+    source_session_id TEXT NOT NULL,
+    source_stage_id   TEXT NOT NULL,
+    matched_version   INTEGER NOT NULL,  -- event version that sealed the outcome
+    at                TEXT NOT NULL,
+    PRIMARY KEY (rule_id, idx)
+);
+
+-- Delivery ledger. The rule_id primary key is the hard exactly-once guard:
+-- a duplicate/unordered trigger can never inject twice, and a late retry
+-- after restart replays as a no-op.
+CREATE TABLE IF NOT EXISTS joint_deliveries (
+    rule_id           TEXT PRIMARY KEY,
+    joint_id          TEXT NOT NULL,
+    target_session_id TEXT NOT NULL,
+    target_stage_id   TEXT NOT NULL,
+    version           INTEGER NOT NULL,  -- target session event version
+    late              INTEGER NOT NULL DEFAULT 0,  -- stage already sealed
+    at                TEXT NOT NULL
+);
 """
 
 

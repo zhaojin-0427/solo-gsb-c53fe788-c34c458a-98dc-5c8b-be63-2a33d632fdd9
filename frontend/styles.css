@@ -172,3 +172,31 @@ label select { display: block; margin-top: 4px; min-width: 220px; }
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: .82rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
 }
+
+/* ---- joint exercise orchestration ---- */
+.member-picker { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.member-chip {
+  display: inline-flex; align-items: center; gap: 8px; margin: 0 !important;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px;
+  padding: 5px 12px; cursor: pointer; font-size: .85rem;
+}
+.member-chip input { width: auto; margin: 0; }
+
+.rule-card { border-color: #314070; }
+.rule-mon { border-color: #314070; }
+.branch-row { background: #17202c; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+@media (max-width: 760px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
+.view-row { margin: 8px 0; }
+button.small { padding: 4px 10px; font-size: .8rem; }
+
+.session-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px; }
+.sess-box { display: block; color: var(--text); text-decoration: none; transition: border-color .15s; }
+.sess-box:hover { border-color: var(--accent); }
+
+.injection {
+  border-color: #3b5f8a; background: #14202e; margin: 8px 0;
+}
+.injection .inj-views { margin-top: 6px; }
+.injection.small { font-size: .85rem; }

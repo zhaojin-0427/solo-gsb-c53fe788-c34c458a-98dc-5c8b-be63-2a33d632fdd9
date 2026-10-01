@@ -3,8 +3,12 @@
  *
  * hash 路由：
  *   #/                         首页：主持人 / 参与者入口
- *   #/host                     主持人控制台（剧本、会话）
+ *   #/host                     主持人控制台（剧本、会话、联合演练）
+ *   #/host/joints              联合演练编排：联演列表
+ *   #/host/joint/<jid>         联演监控台（实时分支等待/阻塞原因）
+ *   #/host/joint/<jid>/edit    联演编排编辑器（依赖 DAG、结局校验）
  *   #/host/session/<sid>       某会话的主持台（实时）
+ *   #/host/drill/<drillId>     剧本版本管理
  *   #/join/<sid>[?invite=...]  参与者输入邀请码
  *   #/play/<sid>               参与者控制台（实时）
  *   #/replay/<sid>             确定性回放
@@ -185,6 +189,14 @@ function route() {
     navContext.textContent = `主持人 · 会话 ${parts[2]}`;
     return hostSessionPage(parts[2]);
   }
+  if (parts[0] === "host" && parts[1] === "joint" && parts[2] && parts[3] === "edit") {
+    navContext.textContent = `主持人 · 编排联演 ${parts[2]}`;
+    return jointEditPage(parts[2]);
+  }
+  if (parts[0] === "host" && parts[1] === "joint" && parts[2]) {
+    navContext.textContent = `主持人 · 联演监控 ${parts[2]}`;
+    return jointMonitorPage(parts[2]);
+  }
   if (parts[0] === "host" && parts[1] === "drill" && parts[2]) {
     navContext.textContent = `主持人 · 剧本版本 ${parts[2]}`;
     return drillVersionPage(parts[2]);
@@ -237,11 +249,12 @@ function homePage() {
 // --------------------------------------------------------------------------- //
 async function hostPage() {
   app.innerHTML = `<div class="card"><h2>主持人控制台</h2><p class="muted">加载中…</p></div>`;
-  let drills, sessions;
+  let drills, sessions, jointsList;
   try {
-    [drills, sessions] = await Promise.all([
+    [drills, sessions, jointsList] = await Promise.all([
       api("/api/drills", { host: true }),
       api("/api/sessions", { host: true }),
+      api("/api/joints", { host: true }),
     ]);
   } catch (e) {
     app.innerHTML = "";
@@ -357,8 +370,36 @@ async function hostPage() {
     }
   }
 
+  const jc = el(`<div class="card"><h2>🔗 联合演练编排</h2>
+    <p class="muted small">把多个<strong>独立会话</strong>编入同一场联演，为各会话阶段配置有向依赖：
+      当全部前置分支都达到指定结局（AND 屏障）后，系统向目标会话的指定阶段
+      <strong>一次性</strong>追加联演注入，并按该会话的角色权限推送。
+      保存前校验会话、阶段、结局有效且依赖无环；重复/乱序到达不会重复投递或提前解锁。</p>
+    <div id="joint-list"></div>
+    <div class="row" style="margin-top:10px">
+      <a href="#/host/joint/new/edit"><button>＋ 编排新的联合演练</button></a>
+    </div>
+  </div>`);
+  const jl = jc.querySelector("#joint-list");
+  if (!jointsList.length) {
+    jl.innerHTML = `<p class="muted small">暂无联演。先创建至少两个会话，再编排依赖。</p>`;
+  } else {
+    for (const j of jointsList) {
+      jl.appendChild(el(`<div class="box">
+        <div class="row">
+          <strong class="mono">${esc(j.id)}</strong>
+          <strong>${esc(j.name)}</strong>
+          <span class="spacer"></span>
+          <a href="#/host/joint/${esc(j.id)}"><button class="ghost">监控台</button></a>
+          <a href="#/host/joint/${esc(j.id)}/edit"><button class="ghost">编排编辑</button></a>
+        </div>
+        <div class="muted small">创建于 ${fmtTime(Number(j.created_at) || null)}</div>
+      </div>`));
+    }
+  }
+
   app.innerHTML = "";
-  app.append(card, sc);
+  app.append(card, jc, sc);
 }
 
 // --------------------------------------------------------------------------- //
@@ -721,6 +762,7 @@ function hostSessionPage(sid) {
         </p>
       </div>
       <div class="card" id="people"></div>
+      <div class="card" id="joints-card" hidden><h2>🔗 所属联合演练</h2><div id="joint-links"></div></div>
       <div class="card" id="stages"><h2>阶段（含各角色隐藏信息）</h2></div>
       <div class="card" id="exports"></div>
     </div>`);
@@ -765,6 +807,35 @@ function hostSessionPage(sid) {
     }
     people.appendChild(table);
 
+    // joints this session belongs to (host fetches the joint list once/render)
+    api("/api/joints", { host: true }).then(async (all) => {
+      const mine = [];
+      for (const jrow of all) {
+        try {
+          const st = await api(`/api/joints/${jrow.id}`, { host: true });
+          if (st.sessions.some((x) => x.id === sid)) mine.push(st);
+        } catch { /* ignore */ }
+      }
+      const card2 = root.querySelector("#joints-card");
+      const links = root.querySelector("#joint-links");
+      if (!card2) return;
+      if (!mine.length) { card2.hidden = true; return; }
+      card2.hidden = false;
+      for (const j of mine) {
+        const delivered = j.rules.filter((r) => r.state === "delivered").length;
+        const waiting = j.rules.filter((r) => r.state === "waiting").length;
+        links.appendChild(el(`<div class="box">
+          <div class="row">
+            <strong>${esc(j.name)}</strong>
+            <span class="chip mono">${esc(j.id)}</span>
+            <span class="chip ok">已投递 ${delivered}</span>
+            <span class="chip warn">等待 ${waiting}</span>
+            <span class="spacer"></span>
+            <a href="#/host/joint/${esc(j.id)}"><button class="ghost">打开联演监控台</button></a>
+          </div></div>`));
+      }
+    }).catch(() => {});
+
     // stages
     const stagesCard = root.querySelector("#stages");
     const curFirst = [...snap.history].sort((a, b) =>
@@ -808,10 +879,31 @@ function hostSessionPage(sid) {
         ${isCurrent && stg.duration ? '<span class="timer" id="host-timer">--</span>' : ""}
       </div>
       <div class="box public"><div class="box-label">公开信息（全员可见）</div>${esc(stg.public)}</div>
+      <div class="injections"></div>
       <div class="views"></div>
       <div class="opts"></div>
       ${stg.kind === "sealed" ? `<div class="muted small">下一阶段：<b>${esc(stg.next || "（结束）")}</b></div>` : ""}
     </div>`);
+
+    for (const inj of stg.injections || []) {
+      const node2 = node.querySelector(".injections");
+      const box = el(`<div class="box injection">
+        <div class="row">
+          <span class="box-label">🔗 联演注入 · ${esc(inj.joint_name)}</span>
+          ${inj.late ? '<span class="chip warn">迟到补投</span>' : '<span class="chip ok">已投递</span>'}
+          <span class="spacer"></span>
+          <span class="muted small mono">v${esc(inj.version)}</span>
+        </div>
+        <div><strong>${esc(inj.title)}</strong></div>
+        <div>${esc(inj.public)}</div>
+        <div class="inj-views"></div>
+      </div>`);
+      const vw = box.querySelector(".inj-views");
+      for (const [rid, text] of Object.entries(inj.views || {})) {
+        vw.appendChild(el(`<div class="box private"><div class="box-label">仅 ${esc(roleName(snap, rid))} 可见</div>${esc(text)}</div>`));
+      }
+      node2.appendChild(box);
+    }
 
     for (const [rid, text] of Object.entries(stg.views || {})) {
       node.querySelector(".views").appendChild(el(
@@ -1053,10 +1145,26 @@ function playPage(sid) {
       </div>
       ${isCurrent && stg.duration ? '<div class="timerbar" id="role-bar"><div style="width:100%"></div></div>' : ""}
       <div class="box public"><div class="box-label">公开信息</div>${esc(stg.public)}</div>
+      <div class="injections"></div>
       ${stg.private ? `<div class="box private"><div class="box-label">仅您可见</div>${esc(stg.private)}</div>` : ""}
       <div class="decision"></div>
       ${!isCurrent ? `<div class="muted small">阶段后续：<b>${esc(stg.next ? "进入下一阶段" : "演练结束")}</b></div>` : ""}
     </div>`);
+
+    for (const inj of stg.injections || []) {
+      const wrap = node.querySelector(".injections");
+      const mine = (inj.views || {})[snap.me.role_id] || "";
+      wrap.appendChild(el(`<div class="box injection">
+        <div class="row">
+          <span class="box-label">🔗 联演注入 · ${esc(inj.joint_name)}</span>
+          ${inj.late ? '<span class="chip warn">迟到补投</span>' : '<span class="chip ok">新消息</span>'}
+        </div>
+        <div><strong>${esc(inj.title)}</strong></div>
+        <div>${esc(inj.public)}</div>
+        ${mine ? `<div class="box private"><div class="box-label">仅您可见</div>${esc(mine)}</div>` : ""}
+      </div>`));
+    }
+
 
     const dec = node.querySelector(".decision");
     if (stg.deciding) {
@@ -1095,6 +1203,507 @@ function playPage(sid) {
       dec.appendChild(el(`<p class="muted small">本阶段您无需决策，请等待其他角色提交或主持人结算。</p>`));
     }
     return node;
+  }
+}
+
+// --------------------------------------------------------------------------- //
+// joint exercise orchestration: editor + live monitor
+// --------------------------------------------------------------------------- //
+const END_OUTCOME = "@end";
+
+class JointLive {
+  constructor(jointId, onSnapshot, onStatus) {
+    this.jointId = jointId;
+    this.onSnapshot = onSnapshot;
+    this.onStatus = onStatus || (() => {});
+    this.closedByUser = false;
+    this.retry = 0;
+    this.connect();
+  }
+  connect() {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(
+      `${proto}://${location.host}/ws/joint/${this.jointId}?host=${encodeURIComponent(HOST_KEY())}`
+    );
+    this.ws = ws;
+    this.onStatus("connecting");
+    ws.onopen = () => { this.retry = 0; this.onStatus("open"); };
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === "joint_snapshot") this.onSnapshot(msg.joint);
+      else if (msg.type === "error") toast(msg.detail || "联演连接错误", "error");
+    };
+    ws.onclose = () => {
+      if (this.closedByUser) return;
+      this.retry = Math.min(this.retry + 1, 6);
+      const delay = Math.min(500 * 2 ** this.retry, 10000);
+      this.onStatus("reconnecting", delay);
+      setTimeout(() => { if (!this.closedByUser) this.connect(); }, delay);
+    };
+  }
+  close() { this.closedByUser = true; try { this.ws.close(); } catch {} }
+}
+
+function jointStatusChip(state) {
+  return ({
+    waiting: ["等待前置", "warn"],
+    ready: ["前置已满足", "ok"],
+    delivering: ["补投中", "warn"],
+    delivered: ["已投递", "ok"],
+  }[state] || [state, ""]);
+}
+
+// ---------- editor ---------- //
+async function jointEditPage(jid) {
+  const isNew = jid === "new";
+  app.innerHTML = `<div class="card"><h2>${isNew ? "编排新的联合演练" : `编辑联演 ${esc(jid)}`}</h2>
+    <p class="muted">加载会话列表…</p></div>`;
+
+  let sessions;
+  try {
+    sessions = await api("/api/sessions", { host: true });
+  } catch (e) {
+    app.innerHTML = "";
+    app.appendChild(el(`<div class="card"><p class="chip danger">${esc(e.message)}</p>
+      <a href="#/host"><button class="ghost">返回控制台</button></a></div>`));
+    return;
+  }
+
+  // Outline cache (pinned script version per session): stages + outcomes + roles.
+  const outlineCache = {};
+  const outline = async (sid) => {
+    if (!outlineCache[sid]) {
+      outlineCache[sid] = await api(`/api/sessions/${encodeURIComponent(sid)}/outline`, { host: true });
+    }
+    return outlineCache[sid];
+  };
+
+  // Editor state.
+  const state0 = {
+    name: "",
+    memberIds: [],
+    rules: [],
+  };
+  let existing = null;
+  if (!isNew) {
+    try {
+      existing = await api(`/api/joints/${encodeURIComponent(jid)}`, { host: true });
+    } catch (e) {
+      app.innerHTML = "";
+      app.appendChild(el(`<div class="card"><p class="chip danger">${esc(e.message)}</p>
+        <a href="#/host"><button class="ghost">返回控制台</button></a></div>`));
+      return;
+    }
+    state0.name = existing.name;
+    state0.memberIds = existing.sessions.map((s) => s.id);
+    state0.rules = existing.rules.map((r) => ({
+      id: r.id,
+      target_session_id: r.target_session_id,
+      target_stage_id: r.target_stage_id,
+      title: r.title,
+      public: r.public,
+      views: Object.entries(r.views || {}).map(([role_id, text]) => ({ role_id, text })),
+      branches: r.branches.map((b) => ({
+        source_session_id: b.source_session_id,
+        source_stage_id: b.source_stage_id,
+        outcome: b.outcome,
+      })),
+    }));
+  }
+
+  const root = el(`<div>
+    <div class="card">
+      <div class="row">
+        <h2 style="margin:0">${isNew ? "编排新的联合演练" : "编排编辑"}</h2>
+        <span class="spacer"></span>
+        <a href="#/host"><button class="ghost">← 返回控制台</button></a>
+        ${!isNew ? `<a href="#/host/joint/${esc(jid)}"><button class="ghost">监控台</button></a>` : ""}
+      </div>
+      <label>联演名称</label>
+      <input type="text" id="j-name" placeholder="如：化工厂泄漏—消防联动联演" />
+      <label>编入联演的独立会话（至少 2 个；各会话保留各自剧本版本与事件记录）</label>
+      <div id="member-picker" class="member-picker"></div>
+    </div>
+    <div class="card">
+      <h2>依赖与注入规则</h2>
+      <p class="muted small">每条规则：选择<strong>目标会话/阶段</strong>与按角色推送的注入内容；
+        再添加若干<strong>前置分支</strong>（上游会话阶段达到指定结局）。
+        多个分支构成 AND 屏障，<strong>全部满足</strong>才释放一次；
+        结局 <code>@end</code> 表示该阶段结算后整场演练结束。保存时统一校验无环与有效性。</p>
+      <div id="rules"></div>
+      <div class="row" style="margin-top:10px">
+        <button id="add-rule" class="ghost">＋ 添加规则</button>
+        <span class="spacer"></span>
+        <button id="save-joint">💾 保存联演编排</button>
+      </div>
+      <p id="save-msg" class="small" style="margin-top:8px"></p>
+    </div>
+  </div>`);
+  app.innerHTML = "";
+  app.appendChild(root);
+
+  const st = state0;
+  root.querySelector("#j-name").value = st.name;
+
+  // member checkboxes
+  const picker = root.querySelector("#member-picker");
+  if (!sessions.length) {
+    picker.innerHTML = `<p class="muted small">还没有会话。请先在控制台基于已发布剧本创建。</p>`;
+  }
+  for (const s of sessions) {
+    const cb = el(`<label class="member-chip">
+      <input type="checkbox" value="${esc(s.id)}" ${st.memberIds.includes(s.id) ? "checked" : ""}/>
+      <span class="mono">${esc(s.id)}</span>
+      <span>${esc(s.drill_name || s.drill_id)} v${esc(s.drill_version)}</span>
+      <span class="chip ${statusChip(s.status)[1]}">${statusChip(s.status)[0]}</span>
+    </label>`);
+    picker.appendChild(cb);
+  }
+  const selectedMembers = () =>
+    [...picker.querySelectorAll("input:checked")].map((c) => c.value);
+
+  // ensure every referenced session outline is loaded for option building
+  async function ensureOutlines(ids) {
+    await Promise.all(ids.map((sid) => outline(sid).catch(() => null)));
+  }
+
+  const rulesWrap = root.querySelector("#rules");
+
+  function stageOptions(sid, selectedStage) {
+    const o = outlineCache[sid];
+    if (!o) return `<option value="">（加载中）</option>`;
+    return o.stages.map((s2) =>
+      `<option value="${esc(s2.id)}" ${s2.id === selectedStage ? "selected" : ""}>
+        ${esc(s2.title)}（${esc(s2.id)}）</option>`).join("");
+  }
+  function outcomeOptions(sid, stageId, selected) {
+    const o = outlineCache[sid];
+    const stg = o && o.stages.find((x) => x.id === stageId);
+    if (!stg) return `<option value="">—</option>`;
+    const outs = stg.outcomes.includes(END_OUTCOME)
+      ? stg.outcomes
+      : [...stg.outcomes, END_OUTCOME];
+    return outs.map((oc) =>
+      `<option value="${esc(oc)}" ${oc === selected ? "selected" : ""}>
+        ${oc === END_OUTCOME ? "@end（演练结束）" : esc(oc)}</option>`).join("");
+  }
+
+  function renderRules() {
+    rulesWrap.innerHTML = "";
+    st.rules.forEach((rule, ri) => rulesWrap.appendChild(ruleCard(rule, ri)));
+  }
+
+  function ruleCard(rule, ri) {
+    const node = el(`<div class="box rule-card">
+      <div class="row">
+        <strong>规则 ${ri + 1}</strong>
+        ${rule.id ? `<span class="chip mono" title="稳定规则标识">${esc(rule.id)}</span>` : ""}
+        <span class="spacer"></span>
+        <button class="ghost danger" data-act="del-rule">删除规则</button>
+      </div>
+      <label>规则标题（注入标题）</label>
+      <input type="text" data-f="title" placeholder="如：跨厂区增援通报" />
+      <div class="grid2">
+        <div><label>目标会话</label><select data-f="target_session_id"></select></div>
+        <div><label>目标阶段</label><select data-f="target_stage_id"></select></div>
+      </div>
+      <label>公开注入文本（目标会话全员可见，可留空）</label>
+      <textarea data-f="public" rows="2" placeholder="注入到目标阶段的公开通报"></textarea>
+      <div class="row" style="margin-top:6px">
+        <strong class="small">按角色推送（仅该角色可见）</strong>
+        <span class="spacer"></span>
+        <button class="ghost small" data-act="add-view">＋ 添加角色密报</button>
+      </div>
+      <div data-views></div>
+      <div class="row" style="margin-top:10px">
+        <strong class="small">前置分支（全部满足才释放）</strong>
+        <span class="spacer"></span>
+        <button class="ghost small" data-act="add-branch">＋ 添加前置分支</button>
+      </div>
+      <div data-branches></div>
+    </div>`);
+    node.querySelector('[data-f="title"]').value = rule.title || "";
+    node.querySelector('[data-f="public"]').value = rule.public || "";
+
+    const memberIds = selectedMembers();
+    const tSel = node.querySelector('[data-f="target_session_id"]');
+    tSel.innerHTML = `<option value="">选择目标会话…</option>` +
+      memberIds.map((sid) =>
+        `<option value="${esc(sid)}" ${sid === rule.target_session_id ? "selected" : ""}>${esc(sid)}</option>`
+      ).join("");
+    const stageSel = node.querySelector('[data-f="target_stage_id"]');
+
+    const rebuildStageSel = () => {
+      const sid = tSel.value;
+      stageSel.innerHTML = sid ? stageOptions(sid, rule.target_stage_id)
+        : `<option value="">先选目标会话</option>`;
+      rule.target_session_id = sid;
+      rule.target_stage_id = stageSel.value || "";
+      renderViews();
+    };
+    tSel.onchange = rebuildStageSel;
+    stageSel.onchange = () => { rule.target_stage_id = stageSel.value; renderViews(); };
+
+    // role-targeted views, based on target session's pinned roles
+    const viewsWrap = node.querySelector("[data-views]");
+    function renderViews() {
+      viewsWrap.innerHTML = "";
+      const o = outlineCache[rule.target_session_id];
+      const roles = o ? o.roles : [];
+      rule.views.forEach((v, vi) => {
+        const row = el(`<div class="view-row">
+          <div class="grid2">
+            <select data-v="role"></select>
+            <button class="ghost danger small" data-v="del">移除</button>
+          </div>
+          <textarea data-v="text" rows="2" placeholder="仅该角色可见的注入文本"></textarea>
+        </div>`);
+        row.querySelector('[data-v="role"]').innerHTML =
+          roles.map((r) =>
+            `<option value="${esc(r.id)}" ${r.id === v.role_id ? "selected" : ""}>${esc(r.name)}（${esc(r.id)}）</option>`
+          ).join("") || `<option value="">（目标会话角色加载中）</option>`;
+        row.querySelector('[data-v="text"]').value = v.text || "";
+        row.querySelector('[data-v="role"]').onchange = (e) => { v.role_id = e.target.value; };
+        row.querySelector('[data-v="text"]').oninput = (e) => { v.text = e.target.value; };
+        row.querySelector('[data-v="del"]').onclick = () => {
+          rule.views.splice(vi, 1); renderViews();
+        };
+        viewsWrap.appendChild(row);
+      });
+    }
+    node.querySelector('[data-act="add-view"]').onclick = () => {
+      const o = outlineCache[rule.target_session_id];
+      if (!o) return toast("请先选择目标会话");
+      rule.views.push({ role_id: o.roles[0]?.id || "", text: "" });
+      renderViews();
+    };
+
+    // branches
+    const brWrap = node.querySelector("[data-branches]");
+    function renderBranches() {
+      brWrap.innerHTML = "";
+      rule.branches.forEach((b, bi) => {
+        const row = el(`<div class="box branch-row">
+          <div class="row small muted">分支 ${bi + 1}：当上游会话阶段结算到指定结局
+            <span class="spacer"></span>
+            <button class="ghost danger small" data-b="del">移除</button></div>
+          <div class="grid3">
+            <div><label>上游会话</label><select data-b="session"></select></div>
+            <div><label>上游阶段</label><select data-b="stage"></select></div>
+            <div><label>指定结局</label><select data-b="outcome"></select></div>
+          </div>
+          <p data-b="hint" class="muted small" style="margin:4px 0 0"></p>
+        </div>`);
+        const sSel = row.querySelector('[data-b="session"]');
+        const stSel = row.querySelector('[data-b="stage"]');
+        const oSel = row.querySelector('[data-b="outcome"]');
+        const hint = row.querySelector('[data-b="hint"]');
+        sSel.innerHTML = `<option value="">选择上游会话…</option>` +
+          memberIds.map((sid) =>
+            `<option value="${esc(sid)}" ${sid === b.source_session_id ? "selected" : ""}>${esc(sid)}</option>`
+          ).join("");
+        const rebuildStages = () => {
+          const sid = sSel.value;
+          stSel.innerHTML = sid ? stageOptions(sid, b.source_stage_id)
+            : `<option value="">先选上游会话</option>`;
+          b.source_session_id = sid;
+          rebuildOutcomes();
+        };
+        const rebuildOutcomes = () => {
+          const sid = sSel.value, stgId = stSel.value;
+          oSel.innerHTML = (sid && stgId) ? outcomeOptions(sid, stgId, b.outcome)
+            : `<option value="">—</option>`;
+          b.source_stage_id = stgId || "";
+          b.outcome = oSel.value || "";
+          if (sid && stgId) {
+            const o = outlineCache[sid];
+            const stg = o && o.stages.find((x) => x.id === stgId);
+            hint.textContent = stg
+              ? `可产生结局：${stg.outcomes.map((x) => x === END_OUTCOME ? "@end" : x).join("、")}`
+              : "";
+          } else hint.textContent = "";
+        };
+        sSel.onchange = rebuildStages;
+        stSel.onchange = rebuildOutcomes;
+        oSel.onchange = () => { b.outcome = oSel.value; };
+        row.querySelector('[data-b="del"]').onclick = () => {
+          rule.branches.splice(bi, 1); renderBranches();
+        };
+        brWrap.appendChild(row);
+        // populate dependent dropdowns if editing
+        if (b.source_session_id) { rebuildStages(); stSel.value = b.source_stage_id; rebuildOutcomes(); oSel.value = b.outcome; }
+      });
+    }
+    node.querySelector('[data-act="add-branch"]').onclick = () => {
+      rule.branches.push({ source_session_id: "", source_stage_id: "", outcome: "" });
+      renderBranches();
+    };
+    node.querySelector('[data-act="del-rule"]').onclick = () => {
+      if (!confirm("删除这条规则？未投递规则的等待状态将一并清除。")) return;
+      st.rules.splice(ri, 1); renderRules();
+    };
+    node.querySelector('[data-f="title"]').oninput = (e) => { rule.title = e.target.value; };
+    node.querySelector('[data-f="public"]').oninput = (e) => { rule.public = e.target.value; };
+
+    rulesWrap.appendChild(node);
+    // async populate once the node is in DOM
+    rebuildStageSel();
+    if (rule.target_session_id) { stageSel.value = rule.target_stage_id; renderViews(); }
+    renderBranches();
+    return node;
+  }
+
+  root.querySelector("#add-rule").onclick = () => {
+    st.rules.push({
+      id: null, target_session_id: "", target_stage_id: "",
+      title: "", public: "", views: [], branches: [],
+    });
+    renderRules();
+  };
+
+  // Re-render rules when membership changes (session option lists change).
+  picker.addEventListener("change", async () => {
+    const ids = selectedMembers();
+    await ensureOutlines(ids);
+    // drop rule selections referencing sessions no longer enrolled
+    for (const r of st.rules) {
+      if (r.target_session_id && !ids.includes(r.target_session_id)) {
+        r.target_session_id = ""; r.target_stage_id = ""; r.views = [];
+      }
+      r.branches = r.branches.filter((b) => ids.includes(b.source_session_id));
+    }
+    renderRules();
+  });
+
+  root.querySelector("#save-joint").onclick = async () => {
+    const msg = root.querySelector("#save-msg");
+    const ids = selectedMembers();
+    const payload = {
+      name: root.querySelector("#j-name").value.trim(),
+      session_ids: ids,
+      rules: st.rules.map((r) => ({
+        ...(r.id ? { id: r.id } : {}),
+        target_session_id: r.target_session_id,
+        target_stage_id: r.target_stage_id,
+        title: (r.title || "").trim(),
+        public: r.public || "",
+        views: Object.fromEntries(
+          r.views.filter((v) => v.role_id && (v.text || "").trim())
+                 .map((v) => [v.role_id, v.text])
+        ),
+        branches: r.branches.map((b) => ({
+          source_session_id: b.source_session_id,
+          source_stage_id: b.source_stage_id,
+          outcome: b.outcome,
+        })),
+      })),
+    };
+    msg.innerHTML = '<span class="muted">校验并保存中…</span>';
+    try {
+      const res = isNew
+        ? await api("/api/joints", { method: "POST", host: true, body: payload })
+        : await api(`/api/joints/${encodeURIComponent(jid)}`, { method: "PUT", host: true, body: payload });
+      msg.innerHTML = '<span class="chip ok">已保存</span>';
+      toast("联合演练编排已保存", "ok");
+      location.hash = `#/host/joint/${res.id}`;
+    } catch (e) {
+      msg.innerHTML = `<span class="chip danger">${esc(e.message)}</span>`;
+      toast(e.message, "error");
+    }
+  };
+
+  // boot: load outlines for preselected members then render
+  await ensureOutlines(st.memberIds);
+  renderRules();
+}
+
+// ---------- live monitor ---------- //
+function jointMonitorPage(jid) {
+  app.innerHTML = `<div class="card"><h2>联演监控台 <span class="mono">${esc(jid)}</span></h2>
+    <p id="connline" class="muted">正在建立实时连接…</p></div>`;
+
+  liveHandle = new JointLive(jid, render, (s, delay) => {
+    const line = document.getElementById("connline");
+    if (!line) return;
+    line.innerHTML = s === "reconnecting"
+      ? `<span class="conn off">● 断开，${(delay / 1000).toFixed(0)}s 后重连…</span>`
+      : s === "open" ? '<span class="conn on">● 已连接</span>'
+      : '<span class="muted">● 连接中…</span>';
+  });
+
+  function render(j) {
+    const root = el(`<div>
+      <div class="card">
+        <div class="row">
+          <h2 style="margin:0">🔗 ${esc(j.name)}</h2>
+          <span class="chip mono">${esc(j.id)}</span>
+          <span class="spacer"></span>
+          <a href="#/host/joint/${esc(j.id)}/edit"><button class="ghost">编排编辑</button></a>
+          <a href="#/host"><button class="ghost">← 控制台</button></a>
+        </div>
+        <p class="muted small" style="margin-bottom:0">
+          成员会话 ${j.summary.members} 个 · 规则 ${j.summary.rules} 条 ·
+          <span class="chip ok">已投递 ${j.summary.delivered}</span>
+          <span class="chip warn">等待中 ${j.summary.waiting}</span>
+          每个成员会话保留各自的剧本版本与独立事件记录；注入仅进入目标会话的事件日志。
+        </p>
+      </div>
+      <div class="card"><h2>成员会话</h2><div id="sessions" class="session-grid"></div></div>
+      <div class="card"><h2>分支等待与阻塞原因</h2><div id="rules"></div></div>
+    </div>`);
+
+    const sg = root.querySelector("#sessions");
+    for (const s of j.sessions) {
+      const [lbl, cls] = statusChip(s.status);
+      sg.appendChild(el(`<a class="box sess-box" href="#/host/session/${esc(s.id)}">
+        <div class="row"><strong class="mono">${esc(s.id)}</strong>
+          <span class="chip ${cls}">${lbl}</span></div>
+        <div class="small">${esc(s.drill_name || s.drill_id || "?")}
+          <span class="chip mono">v${esc(s.drill_version ?? "?")}</span></div>
+        <div class="muted small">${s.current_stage ? `当前阶段：${esc(s.current_stage)}` : "无开放阶段"}</div>
+      </a>`));
+    }
+
+    const rw = root.querySelector("#rules");
+    if (!j.rules.length) rw.innerHTML = `<p class="muted small">暂无规则。</p>`;
+    for (const r of j.rules) {
+      const [slabel, scls] = jointStatusChip(r.state);
+      const card = el(`<div class="box rule-mon">
+        <div class="row">
+          <strong>${esc(r.title)}</strong>
+          <span class="chip ${scls}">${slabel}</span>
+          ${r.delivery?.late ? '<span class="chip warn">迟到补投</span>' : ""}
+          <span class="spacer"></span>
+          <a href="#/host/session/${esc(r.target_session_id)}"><button class="ghost small">目标会话 ${esc(r.target_session_id)}</button></a>
+        </div>
+        <div class="muted small">注入到
+          <b>${esc(r.target_session_id)}</b> 的阶段
+          <b>「${esc(r.target_stage_title)}」</b>
+          （${r.target_sealed ? "已结算" : r.target_reached ? "已到达/开放" : "尚未到达"}）</div>
+        <div class="muted small" style="color:var(--warn)">${esc(r.state_reason)}</div>
+        <table><thead><tr><th>#</th><th>上游会话/阶段</th><th>要求结局</th><th>状态</th><th>阻塞原因</th></tr></thead>
+        <tbody></tbody></table>
+        ${r.delivery ? `<div class="small muted">已于 v${r.delivery.version} 投递 · ${fmtTime(r.delivery.at)}</div>` : ""}
+      </div>`);
+      const tb = card.querySelector("tbody");
+      r.branches.forEach((b, i) => {
+        const ok = b.state === "matched";
+        tb.appendChild(el(`<tr>
+          <td>${i + 1}</td>
+          <td><a href="#/host/session/${esc(b.source_session_id)}"><span class="mono">${esc(b.source_session_id)}</span></a>
+              ·「${esc(b.source_stage_title)}」</td>
+          <td class="mono">${esc(b.outcome === END_OUTCOME ? "@end（演练结束）" : b.outcome)}</td>
+          <td>${ok
+            ? `<span class="chip ok">✓ 已满足 v${b.matched_version}</span>`
+            : '<span class="chip warn">等待</span>'}</td>
+          <td class="small ${ok ? "muted" : ""}">${ok ? `于 ${fmtTime(b.matched_at)} 命中` : esc(b.block_reason)}</td>
+        </tr>`));
+      });
+      rw.appendChild(card);
+    }
+
+    app.innerHTML = "";
+    app.appendChild(root);
   }
 }
 
@@ -1175,9 +1784,18 @@ async function replayPage(sid) {
           : c ? esc(c.label || c.id) : "待提交";
         return `<li>${esc(roleName(snap, rid))}：${text}</li>`;
       }).join("");
+      const injHtml = (stg.injections || []).map((inj) => `
+        <div class="box injection small">
+          <div class="box-label">🔗 联演注入 · ${esc(inj.joint_name)}${inj.late ? "（迟到补投）" : ""}</div>
+          <strong>${esc(inj.title)}</strong>
+          <div>${esc(inj.public)}</div>
+          ${Object.entries(inj.views || {}).map(([rid, t]) =>
+            `<div class="small">仅 ${esc(roleName(snap, rid))}：${esc(t)}</div>`).join("")}
+        </div>`).join("");
       return `<div class="stage ${stg.kind}">
         <div class="stage-title">${esc(stg.title)} <span class="chip mono">${esc(stg.stage_id)}</span></div>
         <div class="box public">${esc(stg.public)}</div>
+        ${injHtml}
         ${choices ? `<ul class="small" style="margin:6px 0">${choices}</ul>` : ""}
       </div>`;
     };
@@ -1187,9 +1805,19 @@ async function replayPage(sid) {
         mine = stg.timed_out ? "⏱ 超时未提交"
           : stg.my_choice ? esc(stg.my_choice_label || stg.my_choice) : "未提交";
       }
+      const injHtml = (stg.injections || []).map((inj) => {
+        const priv = (inj.views || {})[snap.me?.role_id || ""] || "";
+        return `<div class="box injection small">
+          <div class="box-label">🔗 联演注入${inj.late ? "（迟到补投）" : ""}</div>
+          <strong>${esc(inj.title)}</strong>
+          <div>${esc(inj.public)}</div>
+          ${priv ? `<div class="small">仅您可见：${esc(priv)}</div>` : ""}
+        </div>`;
+      }).join("");
       return `<div class="stage ${stg.kind}">
         <div class="stage-title">${esc(stg.title)}</div>
         <div class="box public">${esc(stg.public)}</div>
+        ${injHtml}
         ${stg.private ? `<div class="box private">${esc(stg.private)}</div>` : ""}
         ${mine ? `<div class="small">我的决定：${mine}</div>` : ""}
       </div>`;

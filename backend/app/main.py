@@ -29,6 +29,7 @@ from .db import Database
 from .definitions import DrillError, load_file
 from .engine import Engine, EngineError, now_ts
 from .hub import Client, Hub
+from .joints import JointError, JointOrchestrator, stage_outcomes
 from .records import (
     build_replay,
     host_record,
@@ -77,6 +78,7 @@ class TimerService:
 # set during lifespan
 db = Database(str(config.DB_PATH))
 engine = Engine(db)
+joints = JointOrchestrator(db, engine)
 hub = Hub()
 timers = TimerService()
 
@@ -117,6 +119,36 @@ async def reschedule(session_id: str) -> None:
         timers.cancel(session_id)
 
 
+async def broadcast_joint(joint_id: str) -> None:
+    """Push the live branch-wait snapshot to every monitor of this joint."""
+    try:
+        status = await joints.joint_status(joint_id)
+    except JointError:
+        return
+    hub.push(f"joint:{joint_id}", {"type": "joint_snapshot", "joint": status})
+
+
+async def sync_session_joints(session_id: str) -> None:
+    """After a session commit that could have sealed a stage, reconcile every
+    joint it belongs to, then broadcast:
+      * the monitor snapshot of changed joints (branch waits / block reasons);
+      * a fresh session snapshot to each member whose own state just changed
+        (a fired injection lands in the TARGET session's log)."""
+    affected = await joints.on_session_progress(session_id)
+    touched_sessions: set[str] = set()
+    for jid in affected:
+        await broadcast_joint(jid)
+        try:
+            doc = await joints.get_joint(jid)
+        except JointError:
+            continue
+        touched_sessions.update(doc["session_ids"])
+    # The source session's own snapshot is unaffected by injections, but the
+    # target session (possibly this one) must refresh; cheap to re-send.
+    for sid in touched_sessions:
+        await broadcast_snapshot(sid)
+
+
 async def on_deadline(session_id: str, expected_deadline: float) -> None:
     try:
         info = await engine.settle(
@@ -127,6 +159,7 @@ async def on_deadline(session_id: str, expected_deadline: float) -> None:
     if not info.get("noop"):
         await broadcast_snapshot(session_id)
         await reschedule(session_id)
+        await sync_session_joints(session_id)
 
 
 def parse_yaml_body(yaml_text: str):
@@ -180,6 +213,15 @@ async def lifespan(app: FastAPI):
                 continue
             if state.current is not None:
                 timers.schedule(s["id"], state.deadline)
+
+    # Re-converge joint barriers after a restart: branches that sealed while
+    # we were down get their idempotent hits, and fully-satisfied but
+    # undelivered rules fire their one-shot injections now.
+    for j in await joints.list_joints():
+        try:
+            await joints.reconcile_joint(j["id"])
+        except Exception as exc:  # a broken joint must not block startup
+            print(f"[joint] reconcile {j['id']} skipped: {exc}")
     try:
         yield
     finally:
@@ -211,6 +253,28 @@ class PublishBody(BaseModel):
 class CopyBody(BaseModel):
     source_version: int
     base_version: int | None = None
+
+
+class JointBranchBody(BaseModel):
+    source_session_id: str
+    source_stage_id: str
+    outcome: str  # stage id, or "@end" (sealing the stage ends its drill)
+
+
+class JointRuleBody(BaseModel):
+    id: str | None = None
+    target_session_id: str
+    target_stage_id: str
+    title: str
+    public: str = ""
+    views: dict[str, str] = {}
+    branches: list[JointBranchBody]
+
+
+class JointBody(BaseModel):
+    name: str
+    session_ids: list[str]
+    rules: list[JointRuleBody]
 
 
 @app.get("/api/health")
@@ -364,6 +428,124 @@ async def api_join(session_id: str, body: JoinBody) -> dict[str, Any]:
         return await engine.join(session_id, body.invite, body.name or "")
     except EngineError as exc:
         raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+
+async def _session_defs(session_ids: list[str]) -> tuple[dict[str, Any], dict[str, int]]:
+    """Load each enrolled session's PINNED immutable script definition.
+
+    Sessions in a joint keep independent script versions on purpose, so
+    validation is done per session against its own pinned version — never
+    against a "latest release".
+    """
+    defs: dict[str, Any] = {}
+    versions: dict[str, int] = {}
+    for sid in dict.fromkeys(session_ids):
+        sess = await engine.get_session(sid)  # raises 404 when missing
+        d = await engine.get_version_def(sess["drill_id"], sess["drill_version"])
+        defs[sid] = d
+        versions[sid] = sess["drill_version"]
+    return defs, versions
+
+
+@app.get("/api/joints")
+async def api_joints(x_host_key: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    check_host(x_host_key)
+    return await joints.list_joints()
+
+
+@app.post("/api/joints", status_code=201)
+async def api_create_joint(
+    body: JointBody, x_host_key: str | None = Header(default=None)
+) -> dict[str, Any]:
+    check_host(x_host_key)
+    try:
+        defs, versions = await _session_defs(body.session_ids)
+        raw_rules = [r.model_dump() for r in body.rules]
+        doc = await joints.create_joint(
+            body.name, body.session_ids, raw_rules, defs, versions
+        )
+    except JointError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    except EngineError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    return await joints.joint_status(doc["id"])
+
+
+@app.get("/api/joints/{joint_id}")
+async def api_get_joint(
+    joint_id: str, x_host_key: str | None = Header(default=None)
+) -> dict[str, Any]:
+    check_host(x_host_key)
+    try:
+        return await joints.joint_status(joint_id)
+    except JointError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+
+@app.put("/api/joints/{joint_id}")
+async def api_update_joint(
+    joint_id: str,
+    body: JointBody,
+    x_host_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    check_host(x_host_key)
+    try:
+        defs, versions = await _session_defs(body.session_ids)
+        raw_rules = [r.model_dump() for r in body.rules]
+        await joints.update_joint(
+            joint_id, body.name, body.session_ids, raw_rules, defs, versions
+        )
+        status = await joints.joint_status(joint_id)
+    except JointError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    except EngineError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    await broadcast_joint(joint_id)
+    return status
+
+
+@app.delete("/api/joints/{joint_id}")
+async def api_delete_joint(
+    joint_id: str, x_host_key: str | None = Header(default=None)
+) -> dict[str, bool]:
+    check_host(x_host_key)
+    try:
+        await joints.delete_joint(joint_id)
+    except JointError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    return {"ok": True}
+
+
+@app.get("/api/sessions/{session_id}/outline")
+async def api_session_outline(
+    session_id: str, x_host_key: str | None = Header(default=None)
+) -> dict[str, Any]:
+    """Stage/role/outline of a session's PINNED script version, used by the
+    joint editor to pick stages and validate outcomes."""
+    check_host(x_host_key)
+    try:
+        sess, d, _ = await engine.load(session_id)
+    except EngineError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    return {
+        "session_id": session_id,
+        "status": sess["status"],
+        "drill": {
+            "id": d.id,
+            "name": d.name,
+            "version": sess["drill_version"],
+            "sha256": sess["drill_sha256"],
+        },
+        "roles": [{"id": r.id, "name": r.name} for r in d.roles.values()],
+        "stages": [
+            {
+                "id": stg.id,
+                "title": stg.title,
+                "outcomes": sorted(stage_outcomes(stg)),
+            }
+            for stg in d.stages.values()
+        ],
+    }
 
 
 async def _viewer_for(
@@ -538,6 +720,8 @@ async def _handle_ws_message(
             hub.push_to(client, {"type": "submit_result", **result})
             await broadcast_snapshot(session_id)
             await reschedule(session_id)
+            if result.get("accepted") or result.get("settled"):
+                await sync_session_joints(session_id)
             return
 
         hub.push_to(client, {"type": "error", "code": "unknown_type", "detail": mtype})
@@ -547,16 +731,79 @@ async def _handle_ws_message(
 
 async def _handle_host_message(session_id: str, raw: dict[str, Any]) -> None:
     mtype = raw.get("type")
+    changed = False
     if mtype == "start":
         await engine.start(session_id)
+        changed = True
     elif mtype == "settle":
-        await engine.settle(session_id, "host")
+        info = await engine.settle(session_id, "host")
+        changed = not info.get("noop")
     elif mtype == "end":
         await engine.end_session(session_id)
+        changed = True
     else:
         return
     await broadcast_snapshot(session_id)
     await reschedule(session_id)
+    if changed:
+        await sync_session_joints(session_id)
+
+
+# --------------------------------------------------------------------------- #
+# WebSocket: /ws/joint/{joint_id}?host=... — host-only joint monitor
+# --------------------------------------------------------------------------- #
+@app.websocket("/ws/joint/{joint_id}")
+async def ws_joint(ws: WebSocket, joint_id: str) -> None:
+    host_key = ws.query_params.get("host")
+    await ws.accept()
+    if not host_key or not hmac.compare_digest(host_key, config.HOST_KEY):
+        await ws.send_json({"type": "error", "code": "auth", "detail": "主持人密钥无效"})
+        await ws.close(code=4401)
+        return
+    try:
+        await joints.get_joint(joint_id)
+    except JointError:
+        await ws.send_json({"type": "error", "code": "no_joint", "detail": "联演不存在"})
+        await ws.close(code=4404)
+        return
+
+    channel = f"joint:{joint_id}"
+    client = Client(ws=ws, role_id=None)
+    hub.add(channel, client)
+    sender = asyncio.create_task(_joint_ws_sender(joint_id, client))
+    try:
+        status = await joints.joint_status(joint_id)
+        hub.push_to(client, {"type": "joint_snapshot", "joint": status})
+        while True:
+            raw = await ws.receive_json()
+            # Monitors are read-only; ping keeps the clock/connection fresh.
+            if raw.get("type") == "ping":
+                hub.push_to(client, {"type": "pong", "t": raw.get("t"),
+                                     "server_time": now_ts()})
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        sender.cancel()
+        hub.remove(channel, client)
+
+
+async def _joint_ws_sender(joint_id: str, client: Client) -> None:
+    while True:
+        msg = await client.queue.get()
+        if msg is None:
+            return
+        if msg.get("type") == "resync":
+            try:
+                status = await joints.joint_status(joint_id)
+                msg = {"type": "joint_snapshot", "joint": status}
+            except JointError:
+                return
+        try:
+            await client.ws.send_json(msg)
+        except Exception:
+            return
 
 
 # --------------------------------------------------------------------------- #

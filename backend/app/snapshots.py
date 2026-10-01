@@ -50,6 +50,25 @@ def _block_base(stage: Stage, state: State) -> dict[str, Any]:
     }
 
 
+def _injection_for_viewer(inj, viewer_role: str | None) -> dict[str, Any]:
+    """Permission trim of one joint injection. Host (viewer_role=None) sees
+    everything incl. every role's private block; a participant sees the
+    public text and only their own role's private block."""
+    return {
+        "rule_id": inj.rule_id,
+        "joint_id": inj.joint_id,
+        "joint_name": inj.joint_name,
+        "title": inj.title,
+        "public": inj.public,
+        "late": inj.late,
+        "version": inj.version,
+        "at": _iso(inj.at),
+        "sources": list(inj.sources),
+        "views": dict(inj.views) if viewer_role is None
+        else ({viewer_role: inj.views[viewer_role]} if viewer_role in inj.views else {}),
+    }
+
+
 def _role_history_block(stage: Stage, state: State, role_id: str) -> dict[str, Any]:
     """What one role may see about one stage (past or current)."""
     block = _block_base(stage, state)
@@ -68,6 +87,12 @@ def _role_history_block(stage: Stage, state: State, role_id: str) -> dict[str, A
     sealed = state.sealed.get(stage.id)
     if sealed:
         block["next"] = sealed.next
+    # Cross-session joint injections attached to a reached stage: a role
+    # sees the public text plus only its own role's private block.
+    block["injections"] = (
+        [_injection_for_viewer(i, role_id) for i in state.injections.get(stage.id, [])]
+        if _reached(stage, state) else []
+    )
     return block
 
 
@@ -103,6 +128,9 @@ def _host_history_block(stage: Stage, state: State) -> dict[str, Any]:
     block["transitions"] = [{"when": t.when, "next": t.next} for t in stage.transitions]
     block["default_next"] = stage.default_next
     block["reached"] = _reached(stage, state)
+    block["injections"] = [
+        _injection_for_viewer(i, None) for i in state.injections.get(stage.id, [])
+    ]
     return block
 
 

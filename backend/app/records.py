@@ -11,6 +11,7 @@ from typing import Any
 
 from .definitions import DrillDef
 from .engine import (
+    E_JOINT_INJECTION,
     E_PARTICIPANT_JOINED,
     E_SESSION_ENDED,
     E_SESSION_STARTED,
@@ -118,6 +119,14 @@ def _change(ev: dict[str, Any], d: DrillDef) -> dict[str, Any]:
     elif t == E_SESSION_ENDED:
         base["label"] = f"演练结束（{REASON_LABELS.get(p['reason'], p['reason'])}）"
         base["reason"] = p["reason"]
+    elif t == E_JOINT_INJECTION:
+        base["label"] = (
+            f"联演「{p.get('joint_name') or p.get('joint_id')}」注入：{p.get('title')}"
+            + ("（迟到补投）" if p.get("late") else "")
+        )
+        base["stage_id"] = p["stage_id"]
+        base["joint_id"] = p.get("joint_id")
+        base["late"] = bool(p.get("late"))
     return base
 
 
@@ -159,6 +168,20 @@ def personal_record(
             and sealed.choices.get(role_id) is None,
             "settled_reason": sealed.reason if sealed else None,
             "next_stage": sealed.next if sealed else None,
+            # Joint injections: public text + only this role's private block.
+            "injections": [
+                {
+                    "rule_id": inj.rule_id,
+                    "joint_id": inj.joint_id,
+                    "joint_name": inj.joint_name,
+                    "title": inj.title,
+                    "public": inj.public,
+                    "private": inj.views.get(role_id, ""),
+                    "late": inj.late,
+                    "at": inj.at,
+                }
+                for inj in st.injections.get(sid, [])
+            ],
         }
         stages_out.append(entry)
 
@@ -219,6 +242,21 @@ def host_record(
                 ],
                 "default_next": stage.default_next,
                 "choices": choices,
+                "injections": [
+                    {
+                        "rule_id": inj.rule_id,
+                        "joint_id": inj.joint_id,
+                        "joint_name": inj.joint_name,
+                        "title": inj.title,
+                        "public": inj.public,
+                        "views": dict(inj.views),
+                        "sources": list(inj.sources),
+                        "late": inj.late,
+                        "version": inj.version,
+                        "at": inj.at,
+                    }
+                    for inj in st.injections.get(sid, [])
+                ],
                 "sealed": {
                     "reason": sealed.reason,
                     "reason_label": REASON_LABELS.get(sealed.reason, sealed.reason),
@@ -301,6 +339,16 @@ def render_personal_md(rec: dict[str, Any]) -> str:
                 lines += ["**我的决定：** ⏱ 未在截止前提交（超时）", ""]
             elif s["my_choice"]:
                 lines += [f"**我的决定：** {_md_escape(s['my_choice_label'])}", ""]
+        for inj in s.get("injections", []):
+            lines += [
+                f"> 🔗 **联演注入 — {_md_escape(inj['title'])}**"
+                + ("（迟到补投）" if inj["late"] else ""),
+                f"> 来自联演「{_md_escape(inj['joint_name'])}」",
+                f"> {_md_escape(inj['public'])}",
+            ]
+            if inj.get("private"):
+                lines.append(f"> **仅您可见：** {_md_escape(inj['private'])}")
+            lines.append("")
         if s["settled_reason"]:
             lines += [
                 f"*结算方式：{REASON_LABELS.get(s['settled_reason'], s['settled_reason'])}*",
@@ -372,6 +420,22 @@ def render_host_md(rec: dict[str, Any]) -> str:
                     lines.append(f"- {rname}: ⏱ 超时未提交")
                 else:
                     lines.append(f"- {rname}: {_md_escape(c['label'] or c['choice_id'])}")
+            lines.append("")
+        for inj in s.get("injections", []):
+            lines += [
+                f"**🔗 联演注入 — {_md_escape(inj['title'])}**"
+                + ("（迟到补投）" if inj["late"] else ""),
+                f"来自联演「{_md_escape(inj['joint_name'])}」（规则 `{_md_escape(inj['rule_id'])}`）",
+                "",
+                f"- 公开：{_md_escape(inj['public'])}",
+            ]
+            for rid, text in inj["views"].items():
+                lines.append(f"- 仅 {_role_name(rec, rid)} 可见：{_md_escape(text)}")
+            for src in inj.get("sources", []):
+                lines.append(
+                    f"- 前置：会话 `{_md_escape(src['session_id'])}` 阶段 "
+                    f"`{_md_escape(src['stage_id'])}`（v{src['version']}）"
+                )
             lines.append("")
         if s["sealed"]:
             lines += [

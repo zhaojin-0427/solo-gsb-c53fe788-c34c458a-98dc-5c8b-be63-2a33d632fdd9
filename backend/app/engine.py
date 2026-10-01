@@ -48,6 +48,10 @@ E_STAGE_CHOICE = "stage_choice"
 E_STAGE_SEALED = "stage_sealed"
 E_STAGE_OPENED = "stage_opened"
 E_SESSION_ENDED = "session_ended"
+# Cross-session joint exercise orchestration: a one-shot injection appended
+# to the TARGET session's own event log once all upstream branches are met.
+# It never changes stage flow; it only carries role-permissioned text.
+E_JOINT_INJECTION = "joint_injection"
 
 
 class EngineError(Exception):
@@ -124,6 +128,22 @@ class SealedStage:
 
 
 @dataclass
+class JointInjection:
+    """A fired cross-session injection, recorded in the target session log."""
+    rule_id: str
+    joint_id: str
+    joint_name: str
+    stage_id: str           # stage it was attached to
+    title: str
+    public: str
+    views: dict[str, str]   # role_id -> private text
+    sources: list[dict[str, Any]]
+    late: bool
+    version: int
+    at: float
+
+
+@dataclass
 class State:
     status: str = "created"  # created|running|ended
     end_reason: str | None = None
@@ -136,6 +156,8 @@ class State:
     sealed: dict[str, SealedStage] = field(default_factory=dict)
     order: list[str] = field(default_factory=list)
     roster: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # stage_id -> joint injections delivered for that stage, in arrival order
+    injections: dict[str, list[JointInjection]] = field(default_factory=dict)
 
 
 def reduce_events(events: list[dict[str, Any]]) -> State:
@@ -176,6 +198,22 @@ def reduce_events(events: list[dict[str, Any]]) -> State:
             st.ended_at = p["at"]
             st.current = None
             st.deadline = None
+        elif t == E_JOINT_INJECTION:
+            st.injections.setdefault(p["stage_id"], []).append(
+                JointInjection(
+                    rule_id=p["rule_id"],
+                    joint_id=p.get("joint_id", ""),
+                    joint_name=p.get("joint_name", ""),
+                    stage_id=p["stage_id"],
+                    title=p.get("title", "联演注入"),
+                    public=p.get("public", ""),
+                    views=dict(p.get("views", {})),
+                    sources=list(p.get("sources", [])),
+                    late=bool(p.get("late", False)),
+                    version=ev["version"],
+                    at=p["at"],
+                )
+            )
     return st
 
 
@@ -986,6 +1024,90 @@ class Engine:
             except Exception:
                 await self.db.rollback()
                 raise
+
+    async def deliver_joint_injection(
+        self,
+        session_id: str,
+        *,
+        rule_id: str,
+        joint_id: str,
+        joint_name: str,
+        stage_id: str,
+        title: str,
+        public: str,
+        views: dict[str, str],
+        sources: list[dict[str, Any]],
+        mark_delivered,
+    ) -> dict[str, Any]:
+        """Append exactly one joint-injection event version to *this* session.
+
+        Called by the joint orchestrator once every prerequisite branch has
+        fired. "Exactly once" is guaranteed at two layers: the orchestrator
+        holds the joint lock and consults the joint_deliveries ledger, and
+        this method writes that ledger row inside the same BEGIN IMMEDIATE
+        transaction as the event, so a concurrent duplicate delivery loses
+        the primary-key race and idles without appending anything.
+
+        ``mark_delivered(version, late, at)`` is an async callback invoked
+        inside the transaction to record joint_deliveries (kept here so the
+        ledger write and the event write commit atomically).
+
+        A delivery aimed at a stage that has already been sealed (e.g. an
+        upstream branch satisfied after the target session hurried on) is
+        still delivered once and flagged ``late``; it never re-opens a stage
+        and never changes stage flow. If the stage was never reached the
+        delivery is skipped entirely (the rule stays undelivered and the
+        orchestrator reports the block reason).
+        """
+        import sqlite3
+
+        async with self.lock_for(session_id):
+            await self.db.begin()
+            try:
+                sess, d, state = await self.load(session_id)
+                if stage_id not in d.stages:
+                    # Pinned script check: defensive only — plans are
+                    # validated against the pinned version at save time.
+                    await self.db.rollback()
+                    return {"delivered": False, "reason": "stage_missing"}
+                if stage_id not in state.order:
+                    await self.db.rollback()
+                    return {"delivered": False, "reason": "stage_unreached"}
+
+                ts = now_ts()
+                version = state.last_version + 1
+                late = stage_id in state.sealed
+                payload = {
+                    "rule_id": rule_id,
+                    "joint_id": joint_id,
+                    "joint_name": joint_name,
+                    "stage_id": stage_id,
+                    "title": title,
+                    "public": public,
+                    "views": views,
+                    "sources": sources,
+                    "late": late,
+                    "at": ts,
+                }
+                await self._insert_event(
+                    session_id, version, 0, E_JOINT_INJECTION, "system", payload
+                )
+                try:
+                    await mark_delivered(version, 1 if late else 0, ts)
+                except sqlite3.IntegrityError:
+                    # Another delivery for the same rule committed first.
+                    await self.db.rollback()
+                    return {"delivered": False, "duplicate": True}
+                await self.db.commit()
+            except Exception:
+                await self.db.rollback()
+                raise
+        return {
+            "delivered": True,
+            "version": version,
+            "late": late,
+            "ended": state.status == "ended",
+        }
 
     # ---------- plumbing ----------
     async def _insert_event(
